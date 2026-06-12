@@ -7,45 +7,49 @@ A minimal pi extension that delegates tasks to isolated `pi` child processes. Ea
 ## Install
 
 ```bash
-pi install npm:pi-subagent-lite
-```
-
-Or from git:
-
-```bash
-pi install git:github.com/your-username/pi-subagent-lite.git
+pi install git:github.com/smithyyang/pi-subagent-lite.git
 ```
 
 Or for local development:
 
 ```bash
-pi -e ./src/index.ts
+pi -e /home/youngshine/pi-subagent-lite/src/index.ts
 ```
 
 ## Usage
 
-After installing, ask pi to delegate work:
+After installing, tell pi to use subagents:
 
 ```
-Use the explorer agent to find all API routes in this project. Write the results to /tmp/api-routes.md.
+List available agents and inspect their details, then delegate a research task.
 ```
 
-Or use the `subagent` tool directly from a prompt:
-
-```
-Subagent: explorer
-Task: Find all API route definitions in the codebase. List them with file paths and line numbers.
-Output: /tmp/api-routes.md
-```
+The model will:
+1. Call `subagent(action="list")` to discover available agents
+2. Call `subagent(action="get", agent="explorer")` to inspect an agent's details
+3. Call `subagent(agent="explorer", prompt="...", output="/tmp/result.md")` to delegate
 
 ### Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `agent` | `string` | Yes | — | Agent type name (e.g. `explorer`, `web-search`) |
-| `prompt` | `string` | Yes | — | Full task description. Include all necessary context. |
-| `output` | `string` | Yes | — | Absolute file path where the subagent writes its result. |
+| `action` | `string` | No | — | `"list"` to discover agents, `"get"` to inspect an agent. Omit to delegate. |
+| `agent` | `string` | For delegation & `get` | — | Agent name. |
+| `prompt` | `string` | For delegation | — | Full task description. Include all context. |
+| `output` | `string` | For delegation | — | Absolute file path for result (e.g. `/tmp/research.md`). |
 | `async` | `boolean` | No | `true` | Run in background. `false` waits for completion. |
+
+### Usage Notes (shown to the model)
+
+The tool's description instructs the model to:
+
+1. Use `action="list"` first to discover agents before delegating.
+2. Use `action="get"` to review an agent's full description, tools, and config.
+3. Launch multiple subagents concurrently when possible.
+4. Once delegated, do not duplicate the work — continue with non-overlapping tasks.
+5. The subagent writes its result to the output file; summarize it for the user.
+6. Each subagent starts fresh — provide a highly detailed, self-contained task.
+7. Tell the subagent whether to write code or do research; it does not inherit your session context.
 
 ## Agent Definitions
 
@@ -75,13 +79,13 @@ Provide specific, actionable feedback with file paths and line numbers.
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `name` | Yes | filename | Agent identifier used in tool calls |
-| `description` | Yes | — | What the agent does (shown to main agent) |
+| `description` | Yes | — | What the agent does (shown to main agent via `action="list"`) |
 | `model` | No | pi default | Model override (e.g. `anthropic/claude-sonnet-4-20250514`) |
 | `thinking` | No | pi default | Thinking level: `off`, `low`, `medium`, `high` |
 | `tools` | No | all built-in | Comma-separated allowlist: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` |
 | `extensions` | No | none | Extension paths to load in the child |
 
-The body of the markdown file becomes the agent's system prompt (appended to pi's default prompt).
+The body of the markdown file becomes the agent's system prompt (appended to pi's default prompt via `--append-system-prompt`).
 
 ### Agent Locations (priority order)
 
@@ -97,30 +101,37 @@ The body of the markdown file becomes the agent's system prompt (appended to pi'
 
 ## How It Works
 
-1. Parent calls `subagent(agent, prompt, output, async=true)`
-2. Extension spawns a **separate `pi` process** with the agent's system prompt and tools
-3. The subagent runs fully isolated — its own model, tools, and session
-4. The task includes an instruction to write the result to the output file
-5. When `async=true`, control returns immediately; the parent continues working
-6. When `async=false`, the parent waits for the child to finish
-7. The parent reads the output file to get results at any time
+1. Model calls `subagent(action="list")` to see available agents
+2. Model calls `subagent(action="get", agent="name")` to inspect agent details
+3. Model calls `subagent(agent, prompt, output, async=true)` to delegate
+4. Extension spawns a **separate `pi` process** with the agent's system prompt and tools
+5. The subagent runs fully isolated — its own model, tools, and session
+6. The task includes an instruction to write the result to the output file
+7. When `async=true`, control returns immediately; the parent continues working
+8. When `async=false`, the parent waits for the child to finish
+9. The parent reads the output file to get results at any time
 
 ### Async Workflow
 
 ```
-Parent: subagent(agent="explorer", prompt="Find all API routes", 
+Model: subagent(action="list")
+  → Gets: ["explorer", "web-search", ...]
+
+Model: subagent(action="get", agent="explorer")
+  → Gets: full agent detail (description, tools, system prompt, model)
+
+Model: subagent(agent="explorer", prompt="Find all API routes", 
                  output="/tmp/api-routes.md", async=true)
   → Returns: run_id: "abc123"
 
-Parent: continues working...
-
-Parent: read /tmp/api-routes.md
-  → Gets the subagent's findings
+Model: (continues working on non-overlapping task...)
+  → Can read /tmp/api-routes.md at any point
 ```
 
 ## Design Philosophy
 
-- **One tool** — `subagent` does everything. No separate tools for spawn, wait, list, or manage.
+- **One tool with discovery** — `subagent` does everything: list, inspect, delegate.
+- **Discover before delegate** — The model must first list then inspect agents before using them.
 - **File-based results** — The output file is the contract. No complex IPC.
 - **Async by default** — Fire and forget. Poll the file when you need the result.
 - **No concurrency limits** — Spawn as many as you want. The OS handles scheduling.

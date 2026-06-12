@@ -1,10 +1,14 @@
 /**
  * pi-subagent-lite — Lightweight subagent extension for pi.
  *
- * One tool: `subagent(agent, prompt, output, async=true)`
- * Spawns isolated pi child processes. Each subagent writes its result to a file.
- * Use `action="list"` to discover available agents, `action="get"` for details.
- * No chains, no parallel groups, no management CRUD, no attention tracking.
+ * One tool:
+ *   - Discovery: subagent({ action: "list" | "get" })
+ *   - Single delegation: subagent({ agent, prompt, output, async=true })
+ *   - Parallel delegation: subagent({ tasks: [{ agent, prompt, output }, ...], async=true })
+ *
+ * Subagents run as isolated `pi -p --no-session` child processes and write their
+ * final result to the caller-provided output file. Async runs are grouped into a
+ * batch and notify the main agent once when the whole batch has completed.
  */
 
 import { randomUUID } from "node:crypto";
@@ -12,9 +16,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text, Container, Spacer, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ============================================================================
@@ -31,25 +34,82 @@ interface AgentDef {
 	extensions?: string[];
 }
 
-interface AsyncRun {
-	runId: string;
-	agent: string;
-	prompt: string;
-	output: string;
-	proc: ChildProcess | null;
-	status: "running" | "completed" | "failed";
-	startedAt: number;
-	endedAt?: number;
-	durationMs?: number;
-	error?: string;
-}
-
 interface ParsedAgentFile {
 	attrs: Record<string, unknown>;
 	body: string;
 }
 
 type ToolAction = "list" | "get";
+type RunStatus = "running" | "completed" | "failed";
+type RunMode = "single" | "parallel" | "management";
+
+interface TaskSpec {
+	agent: string;
+	prompt: string;
+	output: string;
+}
+
+interface ChildResult {
+	exitCode: number | null;
+	success: boolean;
+	error?: string;
+}
+
+interface ResultRow {
+	runId?: string;
+	batchId?: string;
+	agent: string;
+	status: RunStatus;
+	exitCode: number | null;
+	error?: string;
+	output: string;
+	outputFile: string;
+	durationMs: number;
+	async: boolean;
+}
+
+interface ToolDetails {
+	mode: RunMode;
+	runId?: string;
+	batchId?: string;
+	results: ResultRow[];
+}
+
+interface AsyncRun {
+	runId: string;
+	batchId: string;
+	agent: string;
+	prompt: string;
+	output: string;
+	proc: ChildProcess | null;
+	status: RunStatus;
+	startedAt: number;
+	endedAt?: number;
+	durationMs?: number;
+	error?: string;
+}
+
+interface AsyncBatch {
+	batchId: string;
+	mode: "single" | "parallel";
+	runIds: string[];
+	startedAt: number;
+	notified: boolean;
+}
+
+interface CompletionEvent {
+	batchId: string;
+	mode: "single" | "parallel";
+	timestamp: number;
+	runs: Array<{
+		runId: string;
+		agent: string;
+		status: RunStatus;
+		output: string;
+		error?: string;
+		durationMs?: number;
+	}>;
+}
 
 // ============================================================================
 // Constants
@@ -64,6 +124,9 @@ const BUILTIN_AGENTS_DIR = new URL("../agents/", import.meta.url).pathname;
 
 const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_LITE_CHILD";
 const ASYNC_COMPLETE_EVENT = "subagent:async-complete";
+const WIDGET_KEY = "pi-subagent-lite";
+const NOTIFY_UNSUB_KEY = "__pi_subagent_lite_notify_unsubscribe__";
+const NOTIFY_SEEN_KEY = "__pi_subagent_lite_notify_seen__";
 const OUTPUT_INSTRUCTION =
 	"\n\n---\n**IMPORTANT:** Write your final result to the output file specified above using the `write` tool. " +
 	"Do not just print the result — write it to the file path provided.";
@@ -107,6 +170,7 @@ function parseFrontmatter(text: string): ParsedAgentFile | null {
 		if (value !== undefined) attrs[key] = value;
 	}
 
+	// YAML list subset:
 	const lines = yaml.split("\n");
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i]!;
@@ -135,8 +199,7 @@ function parseFrontmatter(text: string): ParsedAgentFile | null {
 
 function toArray(val: unknown): string[] | undefined {
 	if (val === undefined || val === null) return undefined;
-	if (Array.isArray(val)) return val.map(String);
-	// Comma-separated string: "read, write, grep"
+	if (Array.isArray(val)) return val.map(String).map((s) => s.trim()).filter(Boolean);
 	if (typeof val === "string") {
 		const items = val.split(",").map((s) => s.trim()).filter(Boolean);
 		return items.length > 0 ? items : undefined;
@@ -213,17 +276,26 @@ function discoverAgents(): AgentDef[] {
 	return agents;
 }
 
+function getAgentMap(): { agents: AgentDef[]; agentMap: Map<string, AgentDef> } {
+	const agents = discoverAgents();
+	const agentMap = new Map<string, AgentDef>();
+	for (const agent of agents) agentMap.set(agent.name, agent);
+	return { agents, agentMap };
+}
+
 // ============================================================================
 // Child Process Spawning
 // ============================================================================
 
-function buildChildArgs(agent: AgentDef, prompt: string, output: string): string[] {
+function buildChildArgs(agent: AgentDef, prompt: string, output: string): { args: string[]; tempDirs: string[] } {
 	const args: string[] = [];
+	const tempDirs: string[] = [];
 
 	args.push("-p", "--no-session");
 
 	if (agent.systemPrompt) {
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
+		tempDirs.push(tmpDir);
 		const promptFile = path.join(tmpDir, "system-prompt.md");
 		fs.writeFileSync(promptFile, agent.systemPrompt, "utf-8");
 		args.push("--append-system-prompt", promptFile);
@@ -231,9 +303,10 @@ function buildChildArgs(agent: AgentDef, prompt: string, output: string): string
 
 	if (agent.model) args.push("--model", agent.model);
 	if (agent.thinking) args.push("--thinking", agent.thinking);
-	const allowedTools = agent.tools?.length
-		? [...new Set([...agent.tools, "write"])]
-		: undefined;
+
+	// If an agent restricts tools, always add `write`, otherwise it cannot fulfill
+	// the file-based contract. The system prompt still governs what it may modify.
+	const allowedTools = agent.tools?.length ? [...new Set([...agent.tools, "write"])] : undefined;
 	if (allowedTools?.length) args.push("--tools", allowedTools.join(","));
 
 	if (agent.extensions?.length) {
@@ -246,6 +319,7 @@ function buildChildArgs(agent: AgentDef, prompt: string, output: string): string
 
 	if (fullTask.length > 8000) {
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-task-"));
+		tempDirs.push(tmpDir);
 		const taskFile = path.join(tmpDir, "task.md");
 		fs.writeFileSync(taskFile, fullTask, "utf-8");
 		args.push(`@${taskFile}`);
@@ -253,7 +327,13 @@ function buildChildArgs(agent: AgentDef, prompt: string, output: string): string
 		args.push(fullTask);
 	}
 
-	return args;
+	return { args, tempDirs };
+}
+
+function cleanupTempDirs(tempDirs: string[]): void {
+	for (const dir of tempDirs) {
+		try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+	}
 }
 
 function spawnChild(
@@ -261,8 +341,8 @@ function spawnChild(
 	prompt: string,
 	output: string,
 	runId: string,
-): { proc: ChildProcess; promise: Promise<{ exitCode: number | null; error?: string }> } {
-	const args = buildChildArgs(agent, prompt, output);
+): { proc: ChildProcess; promise: Promise<ChildResult> } {
+	const { args, tempDirs } = buildChildArgs(agent, prompt, output);
 	const proc = spawn("pi", args, {
 		env: {
 			...process.env,
@@ -277,34 +357,38 @@ function spawnChild(
 	proc.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
 	proc.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 
-	const promise = new Promise<{ exitCode: number | null; error?: string }>((resolve) => {
-		proc.on("close", (code) => {
-			const tmpPrefix = path.join(os.tmpdir(), "pi-subagent-");
-			for (const arg of args) {
-				if (typeof arg === "string" && arg.startsWith(tmpPrefix)) {
-					try { fs.rmSync(path.dirname(arg), { recursive: true, force: true }); } catch { /* ignore */ }
-				}
-			}
+	const promise = new Promise<ChildResult>((resolve) => {
+		let settled = false;
+		const finish = (result: ChildResult) => {
+			if (settled) return;
+			settled = true;
+			cleanupTempDirs(tempDirs);
+			resolve(result);
+		};
 
+		proc.once("close", (code) => {
 			if (code === 0) {
 				if (!fs.existsSync(output)) {
-					resolve({
+					finish({
 						exitCode: code,
+						success: false,
 						error: `Subagent completed but output file was not created: ${output}. stdout: ${truncateStr(stdout, 500)}`,
 					});
 				} else {
-					resolve({ exitCode: code });
+					finish({ exitCode: code, success: true });
 				}
-			} else {
-				resolve({
-					exitCode: code,
-					error: `Subagent exited with code ${code}. stderr: ${truncateStr(stderr, 500)}`,
-				});
+				return;
 			}
+
+			finish({
+				exitCode: code,
+				success: false,
+				error: `Subagent exited with code ${code}. stderr: ${truncateStr(stderr, 500)}`,
+			});
 		});
 
-		proc.on("error", (err) => {
-			resolve({ exitCode: null, error: err.message });
+		proc.once("error", (err) => {
+			finish({ exitCode: null, success: false, error: err.message });
 		});
 	});
 
@@ -315,11 +399,36 @@ function truncateStr(s: string, max: number): string {
 	return s.length > max ? `${s.slice(0, max)}...` : s;
 }
 
+function readOutputFile(output: string): string {
+	try {
+		return fs.existsSync(output) ? fs.readFileSync(output, "utf-8") : "";
+	} catch {
+		return "";
+	}
+}
+
 // ============================================================================
-// TUI Helpers
+// Formatting / TUI helpers
 // ============================================================================
 
 type Theme = ExtensionContext["ui"]["theme"];
+
+function termWidth(): number {
+	return Math.max(60, (process.stdout.columns || 120) - 4);
+}
+
+function bold(theme: Theme, text: string): string {
+	return ((theme as { bold?: (value: string) => string }).bold?.(text)) ?? text;
+}
+
+function shortenPath(filePath: string): string {
+	const home = os.homedir();
+	return filePath.startsWith(`${home}/`) ? `~/${filePath.slice(home.length + 1)}` : filePath;
+}
+
+function fit(text: string, width = termWidth()): string {
+	return truncateToWidth(text, width);
+}
 
 function formatDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
@@ -329,71 +438,331 @@ function formatDuration(ms: number): string {
 	return `${m}m${s}s`;
 }
 
-function formatTokens(n?: number): string {
-	if (n === undefined || n === 0) return "";
-	return n < 1000 ? `${n}` : n < 10000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n / 1000)}k`;
+function runGlyph(status: RunStatus, theme: Theme): string {
+	if (status === "running") return theme.fg("accent", "●");
+	if (status === "completed") return theme.fg("success", "✓");
+	return theme.fg("error", "✗");
+}
+
+function statusLabel(status: RunStatus, theme: Theme): string {
+	if (status === "running") return theme.fg("accent", "running");
+	if (status === "completed") return theme.fg("success", "ok");
+	return theme.fg("error", "failed");
+}
+
+function previewText(text: string, maxLines = 6): string {
+	const trimmed = text.trim();
+	if (!trimmed) return "";
+	const lines = trimmed.split("\n");
+	return [
+		...lines.slice(0, maxLines),
+		...(lines.length > maxLines ? [`... ${lines.length - maxLines} more lines`] : []),
+	].join("\n");
+}
+
+function rowStats(row: ResultRow): string[] {
+	const stats: string[] = [];
+	if (row.durationMs > 0) stats.push(formatDuration(row.durationMs));
+	if (row.async && row.status === "running") stats.push("background");
+	return stats;
+}
+
+function renderManagementText(result: { content: Array<{ type: string; text?: string }> }): Component {
+	const text = result.content[0]?.type === "text" ? (result.content[0].text ?? "") : "";
+	return new Text(fit(text), 0, 0);
+}
+
+function renderSingleResult(row: ResultRow, expanded: boolean, theme: Theme): Component {
+	const c = new Container();
+	const width = termWidth();
+	const stats = rowStats(row);
+	const statsText = stats.length ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", stats.join(" · "))}` : "";
+	c.addChild(new Text(fit(`${runGlyph(row.status, theme)} ${theme.fg("toolTitle", bold(theme, row.agent))} ${theme.fg("dim", "·")} ${statusLabel(row.status, theme)}${statsText}`, width), 0, 0));
+	c.addChild(new Text(fit(theme.fg("dim", `  ⎿ output: ${shortenPath(row.outputFile)}`), width), 0, 0));
+	if (row.runId) c.addChild(new Text(fit(theme.fg("dim", `    run: ${row.runId}${row.batchId ? ` · batch: ${row.batchId}` : ""}`), width), 0, 0));
+
+	if (!expanded) return c;
+
+	if (row.error) c.addChild(new Text(fit(theme.fg("error", `  error: ${row.error}`), width), 0, 0));
+	const preview = previewText(row.output, 8);
+	if (preview) {
+		c.addChild(new Spacer(1));
+		for (const line of preview.split("\n")) c.addChild(new Text(fit(theme.fg("dim", `  ${line}`), width), 0, 0));
+	}
+	return c;
+}
+
+function renderParallelResult(details: ToolDetails, expanded: boolean, theme: Theme): Component {
+	const c = new Container();
+	const width = termWidth();
+	const total = details.results.length;
+	const running = details.results.filter((r) => r.status === "running").length;
+	const completed = details.results.filter((r) => r.status === "completed").length;
+	const failed = details.results.filter((r) => r.status === "failed").length;
+	const status: RunStatus = running > 0 ? "running" : failed > 0 ? "failed" : "completed";
+	const headerStats = running > 0
+		? `${running} running · ${completed}/${total} done`
+		: `${completed}/${total} ok${failed ? ` · ${failed} failed` : ""}`;
+
+	c.addChild(new Text(fit(`${runGlyph(status, theme)} ${theme.fg("toolTitle", bold(theme, "parallel"))} ${theme.fg("dim", `×${total} · ${headerStats}`)}${details.batchId ? theme.fg("dim", ` · batch ${details.batchId}`) : ""}`, width), 0, 0));
+
+	for (const [i, row] of details.results.entries()) {
+		const branch = i === details.results.length - 1 ? "└" : "├";
+		const stats = rowStats(row);
+		const statsText = stats.length ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", stats.join(" · "))}` : "";
+		c.addChild(new Text(fit(`  ${theme.fg("dim", branch)} ${runGlyph(row.status, theme)} ${bold(theme, row.agent)} ${theme.fg("dim", "·")} ${statusLabel(row.status, theme)}${statsText}`, width), 0, 0));
+		c.addChild(new Text(fit(theme.fg("dim", `  ${i === details.results.length - 1 ? " " : "│"}   output: ${shortenPath(row.outputFile)}`), width), 0, 0));
+		if (expanded && row.error) c.addChild(new Text(fit(theme.fg("error", `  ${i === details.results.length - 1 ? " " : "│"}   error: ${row.error}`), width), 0, 0));
+		if (expanded && row.output) {
+			const first = previewText(row.output, 2).split("\n")[0];
+			if (first) c.addChild(new Text(fit(theme.fg("dim", `  ${i === details.results.length - 1 ? " " : "│"}   ⎿ ${first}`), width), 0, 0));
+		}
+	}
+
+	return c;
+}
+
+function renderAsyncWidget(asyncRuns: Map<string, AsyncRun>, asyncBatches: Map<string, AsyncBatch>, ctx: ExtensionContext): void {
+	if (!ctx.hasUI) return;
+	const batches = [...asyncBatches.values()]
+		.sort((a, b) => b.startedAt - a.startedAt)
+		.slice(0, 5);
+	if (batches.length === 0) {
+		ctx.ui.setWidget(WIDGET_KEY, undefined);
+		return;
+	}
+
+	ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => {
+		const c = new Container();
+		c.addChild(new Text(theme.fg("dim", "subagents"), 0, 0));
+		for (const batch of batches) {
+			const runs = batch.runIds.map((id) => asyncRuns.get(id)).filter((r): r is AsyncRun => Boolean(r));
+			const running = runs.filter((r) => r.status === "running").length;
+			const completed = runs.filter((r) => r.status === "completed").length;
+			const failed = runs.filter((r) => r.status === "failed").length;
+			const status: RunStatus = running > 0 ? "running" : failed > 0 ? "failed" : "completed";
+			const label = batch.mode === "parallel" ? `parallel ×${runs.length}` : (runs[0]?.agent ?? "subagent");
+			const stats = running > 0 ? `${running} running · ${completed}/${runs.length} done` : `${completed}/${runs.length} ok${failed ? ` · ${failed} failed` : ""}`;
+			c.addChild(new Text(fit(`${runGlyph(status, theme)} ${theme.fg("toolTitle", bold(theme, label))} ${theme.fg("dim", `· ${stats} · ${batch.batchId}`)}`), 0, 0));
+			for (const run of runs.slice(0, 4)) {
+				c.addChild(new Text(fit(theme.fg("dim", `  ${runGlyph(run.status, theme)} ${run.agent} · ${run.status} · ${shortenPath(run.output)}`)), 0, 0));
+			}
+			if (runs.length > 4) c.addChild(new Text(theme.fg("dim", `  +${runs.length - 4} more`), 0, 0));
+		}
+		return c;
+	}, { placement: "aboveEditor" });
+}
+
+// ============================================================================
+// Completion notifications
+// ============================================================================
+
+function getSeenMap(): Map<string, number> {
+	const store = globalThis as Record<string, unknown>;
+	const existing = store[NOTIFY_SEEN_KEY];
+	if (existing instanceof Map) return existing as Map<string, number>;
+	const map = new Map<string, number>();
+	store[NOTIFY_SEEN_KEY] = map;
+	return map;
+}
+
+function seenRecently(key: string, ttlMs = 10 * 60 * 1000): boolean {
+	const seen = getSeenMap();
+	const now = Date.now();
+	for (const [k, ts] of seen.entries()) if (now - ts > ttlMs) seen.delete(k);
+	if (seen.has(key)) return true;
+	seen.set(key, now);
+	return false;
+}
+
+function buildCompletionContent(event: CompletionEvent): string {
+	const runs = event.runs;
+	if (runs.length === 1) {
+		const run = runs[0]!;
+		const duration = run.durationMs ? ` (${formatDuration(run.durationMs)})` : "";
+		const out = readOutputFile(run.output);
+		const preview = previewText(out, 8) || run.error || "(no output)";
+		return [
+			`Background task ${run.status}: **${run.agent}**${duration}`,
+			"",
+			`Output file: ${run.output}`,
+			"",
+			preview,
+		].join("\n");
+	}
+
+	const ok = runs.filter((r) => r.status === "completed").length;
+	const failed = runs.filter((r) => r.status === "failed").length;
+	const lines = [
+		`Background subagents finished: **${ok}/${runs.length} completed**${failed ? `, **${failed} failed**` : ""}`,
+		"",
+	];
+	for (const run of runs) {
+		const duration = run.durationMs ? ` · ${formatDuration(run.durationMs)}` : "";
+		lines.push(`- **${run.agent}**: ${run.status}${duration}`);
+		lines.push(`  Output: ${run.output}`);
+		if (run.error) lines.push(`  Error: ${run.error}`);
+	}
+	return lines.join("\n");
+}
+
+function registerCompletionNotifier(pi: ExtensionAPI): void {
+	const store = globalThis as Record<string, unknown>;
+	const previous = store[NOTIFY_UNSUB_KEY];
+	if (typeof previous === "function") {
+		try { previous(); } catch { /* ignore stale unsubscribe */ }
+	}
+
+	store[NOTIFY_UNSUB_KEY] = pi.events.on(ASYNC_COMPLETE_EVENT, (data: unknown) => {
+		const event = data as CompletionEvent;
+		if (!event?.batchId || !Array.isArray(event.runs)) return;
+		if (seenRecently(`batch:${event.batchId}`)) return;
+
+		pi.sendMessage(
+			{
+				customType: "subagent-notify",
+				content: buildCompletionContent(event),
+				display: true,
+				details: event,
+			},
+			{ triggerTurn: true },
+		);
+	});
+
+	pi.on("session_shutdown", () => {
+		const unsubscribe = store[NOTIFY_UNSUB_KEY];
+		if (typeof unsubscribe === "function") {
+			try { unsubscribe(); } catch { /* ignore */ }
+			delete store[NOTIFY_UNSUB_KEY];
+		}
+	});
 }
 
 // ============================================================================
 // Extension Entry Point
 // ============================================================================
 
+const TaskSchema = Type.Object({
+	agent: Type.String({ description: "Agent name." }),
+	prompt: Type.String({ description: "Full task description for this subagent." }),
+	output: Type.String({ description: "Absolute file path for this subagent's result." }),
+});
+
+function paramsToTasks(params: Record<string, unknown>): TaskSpec[] | string {
+	const maybeTasks = params.tasks;
+	if (Array.isArray(maybeTasks)) {
+		if (maybeTasks.length === 0) return "tasks must contain at least one task.";
+		return maybeTasks.map((item, index) => {
+			const t = item as Partial<TaskSpec>;
+			if (!t.agent || !t.prompt || !t.output) {
+				throw new Error(`tasks[${index}] requires agent, prompt, and output.`);
+			}
+			return { agent: t.agent, prompt: t.prompt, output: t.output };
+		});
+	}
+
+	const agent = params.agent as string | undefined;
+	const prompt = params.prompt as string | undefined;
+	const output = params.output as string | undefined;
+	if (!agent || !prompt || !output) return "Delegation requires agent, prompt, and output, or tasks[]. Use action=\"list\" to see available agents.";
+	return [{ agent, prompt, output }];
+}
+
 export default function (pi: ExtensionAPI): void {
 	if (process.env[SUBAGENT_CHILD_ENV] === "1") return;
 
-	const agents = discoverAgents();
-	const agentMap = new Map<string, AgentDef>();
-	for (const a of agents) agentMap.set(a.name, a);
-
 	const asyncRuns = new Map<string, AsyncRun>();
+	const asyncBatches = new Map<string, AsyncBatch>();
+
+	const maybeEmitBatchComplete = (batch: AsyncBatch, ctx?: ExtensionContext): void => {
+		if (batch.notified) return;
+		const runs = batch.runIds.map((id) => asyncRuns.get(id)).filter((r): r is AsyncRun => Boolean(r));
+		if (runs.length !== batch.runIds.length) return;
+		if (runs.some((run) => run.status === "running")) return;
+
+		batch.notified = true;
+		pi.events.emit(ASYNC_COMPLETE_EVENT, {
+			batchId: batch.batchId,
+			mode: batch.mode,
+			timestamp: Date.now(),
+			runs: runs.map((run) => ({
+				runId: run.runId,
+				agent: run.agent,
+				status: run.status,
+				output: run.output,
+				error: run.error,
+				durationMs: run.durationMs,
+			})),
+		} satisfies CompletionEvent);
+		renderAsyncWidget(asyncRuns, asyncBatches, ctx ?? ({ hasUI: false } as ExtensionContext));
+	};
+
+	const finishAsyncRun = (run: AsyncRun, result: ChildResult, ctx?: ExtensionContext): void => {
+		if (run.status !== "running") return;
+		run.status = result.success ? "completed" : "failed";
+		run.endedAt = Date.now();
+		run.durationMs = run.endedAt - run.startedAt;
+		run.error = result.error;
+		run.proc = null;
+		const batch = asyncBatches.get(run.batchId);
+		if (batch) maybeEmitBatchComplete(batch, ctx);
+		if (ctx) renderAsyncWidget(asyncRuns, asyncBatches, ctx);
+	};
+
+	registerCompletionNotifier(pi);
 
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: `Delegate a task to a specialized subagent, or discover available agents.
+		description: `Delegate tasks to specialized subagents, or discover available agents.
 
 USAGE:
-• To delegate: { agent: "name", prompt: "...", output: "/tmp/result.md" }
+• To delegate one task: { agent: "name", prompt: "...", output: "/tmp/result.md" }
+• To delegate multiple tasks concurrently in one call: { tasks: [{ agent, prompt, output }, ...] }
 • To list agents: { action: "list" }
 • To get agent details: { action: "get", agent: "name" }
 
 Always start by using action="list" to discover available agents before delegating. Then use action="get" to review an agent's full description, tools, and configuration.
 
 USAGE NOTES:
-1. Launch multiple subagents concurrently whenever possible, to maximize performance; use a single message with multiple tool uses.
+1. Launch multiple subagents concurrently whenever possible, to maximize performance; prefer one tool call with tasks[] for parallel work.
 2. Once you have delegated work to a subagent, do not duplicate that work yourself. Continue with non-overlapping tasks while the subagent runs.
-3. When an async subagent completes, you will be automatically notified via a follow-up message. Read the output file at the specified path to get the full result.
+3. When an async batch completes, you will be automatically notified via a follow-up message. Read each output file to get the full result.
 4. Each subagent invocation starts with a fresh context. Your prompt should contain a highly detailed task description for the subagent to perform autonomously. Specify exactly what information the agent should write to the output file.
 5. The subagent's outputs should generally be trusted.
 6. Clearly tell the subagent whether you expect it to write code or just do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent. Tell it how to verify its work if possible.
-7. The subagent has its own tools (read, bash, edit, write) and model — it does NOT inherit your session context, conversation history, or tool results.`,
+7. The subagent has its own tools and model — it does NOT inherit your session context, conversation history, or tool results.`,
 		parameters: Type.Object({
 			action: Type.Optional(Type.String({
 				enum: ["list", "get"],
 				description: "Management action: 'list' to discover agents, 'get' to inspect an agent's details. Omit to delegate.",
 			})),
 			agent: Type.Optional(Type.String({
-				description: "Agent name. Required for delegation (agent+prompt+output) and action='get'.",
+				description: "Agent name. Required for single delegation and action='get'.",
 			})),
 			prompt: Type.Optional(Type.String({
-				description: "Full task description for the subagent (required for delegation). Include all necessary context.",
+				description: "Full task description for single delegation. Include all necessary context.",
 			})),
 			output: Type.Optional(Type.String({
-				description: "Absolute file path for the result (required for delegation). The subagent writes its result to this file using the write tool.",
+				description: "Absolute file path for the single delegation result.",
+			})),
+			tasks: Type.Optional(Type.Array(TaskSchema, {
+				description: "Parallel delegation: array of {agent, prompt, output}. All tasks start concurrently in one batch.",
 			})),
 			async: Type.Optional(Type.Boolean({
-				description: "Run in background (default: true). If false, waits for the subagent to finish before returning. Prefer sync when the result is needed immediately; prefer async for long-running independent tasks.",
+				description: "Run in background (default: true). If false, waits for all subagents to finish before returning.",
 			})),
 		}),
-		async execute(id, params, _signal, onUpdate, ctx) {
-			const action = params.action as ToolAction | undefined;
 
-			// ---- MANAGEMENT: list ----
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const action = params.action as ToolAction | undefined;
+			const { agents, agentMap } = getAgentMap();
+
 			if (action === "list") {
 				if (agents.length === 0) {
 					return {
 						content: [{ type: "text", text: "No agents found. Define agents in ~/.pi/agent/agents/*.md or .pi/agents/*.md" }],
-						details: null,
+						details: { mode: "management", results: [] } satisfies ToolDetails,
 					};
 				}
 				const lines = agents.map((a) => `  - **${a.name}**: ${a.description}`);
@@ -402,24 +771,23 @@ USAGE NOTES:
 						type: "text",
 						text: `Available agents:\n${lines.join("\n")}\n\nUse action="get" with an agent name to see full details including system prompt, model, and tools.`,
 					}],
-					details: null,
+					details: { mode: "management", results: [] } satisfies ToolDetails,
 				};
 			}
 
-			// ---- MANAGEMENT: get ----
 			if (action === "get") {
 				const name = params.agent as string | undefined;
 				if (!name) {
 					return {
 						content: [{ type: "text", text: "Specify agent: { action: \"get\", agent: \"name\" }" }],
-						details: null,
+						details: { mode: "management", results: [] } satisfies ToolDetails,
 					};
 				}
 				const agent = agentMap.get(name);
 				if (!agent) {
 					return {
 						content: [{ type: "text", text: `Unknown agent "${name}". Use action="list" to see available agents.` }],
-						details: null,
+						details: { mode: "management", results: [] } satisfies ToolDetails,
 					};
 				}
 
@@ -437,194 +805,143 @@ USAGE NOTES:
 
 				return {
 					content: [{ type: "text", text: lines.join("\n") }],
-					details: null,
+					details: { mode: "management", results: [] } satisfies ToolDetails,
 				};
 			}
 
-			// ---- DELEGATION ----
-			const agentName = params.agent as string;
-			const prompt = params.prompt as string;
-			const output = params.output as string;
+			let tasks: TaskSpec[];
+			try {
+				const parsed = paramsToTasks(params as Record<string, unknown>);
+				if (typeof parsed === "string") {
+					return {
+						content: [{ type: "text", text: parsed }],
+						details: { mode: "management", results: [] } satisfies ToolDetails,
+					};
+				}
+				tasks = parsed;
+			} catch (error) {
+				return {
+					content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+					details: { mode: "management", results: [] } satisfies ToolDetails,
+				};
+			}
+
+			const missing = tasks.find((task) => !agentMap.has(task.agent));
+			if (missing) {
+				return {
+					content: [{ type: "text", text: `Unknown agent: "${missing.agent}". Use action="list" to see available agents.` }],
+					details: { mode: "management", results: [] } satisfies ToolDetails,
+				};
+			}
+
+			for (const task of tasks) fs.mkdirSync(path.dirname(task.output), { recursive: true });
+
 			const asyncMode = params.async !== false;
-
-			if (!agentName || !prompt || !output) {
-				return {
-					content: [{
-						type: "text",
-						text: "Delegation requires agent, prompt, and output parameters. Use action=\"list\" to see available agents.",
-					}],
-					details: null,
-				};
-			}
-
-			const agent = agentMap.get(agentName);
-			if (!agent) {
-				return {
-					content: [{ type: "text", text: `Unknown agent: "${agentName}". Use action="list" to see available agents.` }],
-					details: { mode: "single", results: [{ agent: agentName, exitCode: 1, error: `Unknown agent: ${agentName}`, output: "", outputFile: output, durationMs: 0, async: asyncMode }] },
-				};
-			}
-
-			fs.mkdirSync(path.dirname(output), { recursive: true });
+			const mode: "single" | "parallel" = tasks.length === 1 ? "single" : "parallel";
+			const batchId = randomUUID().slice(0, 12);
 
 			if (asyncMode) {
-				const runId = randomUUID().slice(0, 12);
-				const { proc, promise } = spawnChild(agent, prompt, output, runId);
+				const batch: AsyncBatch = { batchId, mode, runIds: [], startedAt: Date.now(), notified: false };
+				asyncBatches.set(batchId, batch);
+				const resultRows: ResultRow[] = [];
 
-				const run: AsyncRun = {
-					runId,
-					agent: agentName,
-					prompt,
-					output,
-					proc,
-					status: "running",
-					startedAt: Date.now(),
-				};
-				asyncRuns.set(runId, run);
-
-				promise.then((result) => {
-					run.status = result.exitCode === 0 ? "completed" : "failed";
-					run.endedAt = Date.now();
-					run.durationMs = run.endedAt - run.startedAt;
-					run.error = result.error;
-					run.proc = null;
-
-					try {
-						pi.events.emit(ASYNC_COMPLETE_EVENT, {
-							runId,
-							agent: agentName,
-							status: run.status,
-							output,
-							durationMs: run.durationMs,
-						});
-					} catch { /* best effort */ }
-				});
-
-				return {
-					content: [{
-						type: "text",
-						text: `Started subagent "${agentName}" (run_id: ${runId}). The result will be written to ${output}. Continue with non-overlapping work while it runs.`,
-					}],
-					details: {
-						mode: "single",
+				for (const task of tasks) {
+					const runId = randomUUID().slice(0, 12);
+					const agent = agentMap.get(task.agent)!;
+					const { proc, promise } = spawnChild(agent, task.prompt, task.output, runId);
+					const run: AsyncRun = {
 						runId,
-						results: [{
-							agent: agentName,
-							exitCode: null,
-							output: "",
-							outputFile: output,
-							usage: undefined,
-							durationMs: 0,
-							async: true,
-						}],
-					},
-				};
-			} else {
-				const runId = randomUUID().slice(0, 12);
-				const { promise } = spawnChild(agent, prompt, output, runId);
-				const startedAt = Date.now();
-				const result = await promise;
-				const durationMs = Date.now() - startedAt;
-
-				let outputText = "";
-				try {
-					if (fs.existsSync(output)) {
-						outputText = fs.readFileSync(output, "utf-8");
-					}
-				} catch { /* ignore */ }
-
-				const exitOk = result.exitCode === 0 && fs.existsSync(output);
-				return {
-					content: [{ type: "text", text: outputText || result.error || "(no output)" }],
-					details: {
-						mode: "single",
+						batchId,
+						agent: task.agent,
+						prompt: task.prompt,
+						output: task.output,
+						proc,
+						status: "running",
+						startedAt: Date.now(),
+					};
+					asyncRuns.set(runId, run);
+					batch.runIds.push(runId);
+					promise.then((result) => finishAsyncRun(run, result, ctx));
+					resultRows.push({
 						runId,
-						results: [{
-							agent: agentName,
-							exitCode: exitOk ? 0 : result.exitCode,
-							error: result.error,
-							output: outputText,
-							outputFile: output,
-							usage: undefined,
-							durationMs,
-							async: false,
-						}],
-					},
+						batchId,
+						agent: task.agent,
+						status: "running",
+						exitCode: null,
+						output: "",
+						outputFile: task.output,
+						durationMs: 0,
+						async: true,
+					});
+				}
+
+				renderAsyncWidget(asyncRuns, asyncBatches, ctx);
+
+				const content = mode === "parallel"
+					? `Started ${tasks.length} subagents in parallel (batch_id: ${batchId}). Results will be written to their output files. Continue with non-overlapping work while they run.`
+					: `Started subagent "${tasks[0]!.agent}" (run_id: ${resultRows[0]!.runId}, batch_id: ${batchId}). The result will be written to ${tasks[0]!.output}. Continue with non-overlapping work while it runs.`;
+				return {
+					content: [{ type: "text", text: content }],
+					details: { mode, batchId, runId: resultRows[0]?.runId, results: resultRows } satisfies ToolDetails,
 				};
 			}
+
+			const jobs = tasks.map((task) => {
+				const runId = randomUUID().slice(0, 12);
+				const startedAt = Date.now();
+				const agent = agentMap.get(task.agent)!;
+				return { task, runId, startedAt, ...spawnChild(agent, task.prompt, task.output, runId) };
+			});
+			const childResults = await Promise.all(jobs.map((job) => job.promise));
+			const rows: ResultRow[] = childResults.map((result, index) => {
+				const job = jobs[index]!;
+				const outputText = readOutputFile(job.task.output);
+				return {
+					runId: job.runId,
+					batchId,
+					agent: job.task.agent,
+					status: result.success ? "completed" : "failed",
+					exitCode: result.exitCode,
+					error: result.error,
+					output: outputText,
+					outputFile: job.task.output,
+					durationMs: Date.now() - job.startedAt,
+					async: false,
+				};
+			});
+
+			const content = rows.map((row, index) => {
+				const header = tasks.length > 1 ? `=== Task ${index + 1}: ${row.agent} (${row.status}) ===` : "";
+				const body = row.output || row.error || "(no output)";
+				return header ? `${header}\n${body}` : body;
+			}).join("\n\n");
+
+			return {
+				content: [{ type: "text", text: content }],
+				details: { mode, batchId, runId: rows[0]?.runId, results: rows } satisfies ToolDetails,
+			};
 		},
 
 		renderCall(args, theme) {
 			if (args.action) {
 				const target = args.action === "get" && args.agent ? ` ${args.agent}` : "";
-				return new Text(`${theme.fg("toolTitle", `subagent ${args.action}${target}`)}`, 0, 0);
+				return new Text(`${theme.fg("toolTitle", bold(theme, `subagent ${args.action}${target}`))}`, 0, 0);
 			}
-			const agent = (args.agent as string) || "?";
-			const asyncLabel = args.async === false ? "" : theme.fg("warning", " [async]");
-			return new Text(`${theme.fg("toolTitle", `subagent ${agent}`)}${asyncLabel}`, 0, 0);
+			const taskCount = Array.isArray(args.tasks) ? args.tasks.length : 1;
+			const label = taskCount > 1 ? `subagent parallel ×${taskCount}` : `subagent ${(args.agent as string) || "?"}`;
+			const asyncLabel = args.async === false ? theme.fg("dim", " [sync]") : theme.fg("warning", " [async]");
+			return new Text(`${theme.fg("toolTitle", bold(theme, label))}${asyncLabel}`, 0, 0);
 		},
 
 		renderResult(result, options, theme) {
-			// Management actions (list/get) show text content directly
-			if (!result.details) {
-				const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-				return new Text(truncateToWidth(text, (process.stdout.columns || 120) - 4), 0, 0);
-			}
-
-			const d = result.details as { mode: string; results: Array<{
-				agent: string;
-				exitCode: number | null;
-				error?: string;
-				output: string;
-				outputFile: string;
-				durationMs: number;
-				async: boolean;
-			}> } | undefined;
-
-			if (!d?.results?.length) return new Text("", 0, 0);
-
-			const width = (process.stdout.columns || 120) - 4;
-			const expanded = options.expanded;
-
-			if (d.mode === "single" && d.results.length === 1) {
-				const r = d.results[0]!;
-				if (expanded) {
-					const lines: string[] = [];
-					const icon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-					const status = r.exitCode === 0 ? "ok" : "failed";
-					lines.push(`${icon} ${theme.fg("toolTitle", r.agent)} ${theme.fg("dim", status)}`);
-					if (r.durationMs) lines.push(`  ${theme.fg("dim", `duration: ${formatDuration(r.durationMs)}`)}`);
-					lines.push(`  ${theme.fg("dim", `output: ${r.outputFile}`)}`);
-					if (r.output) {
-						const preview = r.output.split("\n").slice(0, 5).join("\n");
-						lines.push(`  ${theme.fg("dim", `⎿  ${preview}`)}`);
-						if (r.output.split("\n").length > 5) lines.push(`  ${theme.fg("dim", `    ... ${r.output.split("\n").length - 5} more lines`)}`);
-					}
-					if (r.error) lines.push(`  ${theme.fg("error", `error: ${r.error}`)}`);
-					return new Text(truncateToWidth(lines.join("\n"), width), 0, 0);
-				}
-
-				const icon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-				const status = r.exitCode === 0 ? "ok" : r.error ? "failed" : "?";
-				const stats = [
-					r.usage?.turns ? `⟳ ${r.usage.turns}` : "",
-					r.usage?.input ? `${formatTokens(r.usage.input)} in` : "",
-					r.usage?.output ? `${formatTokens(r.usage.output)} out` : "",
-					r.durationMs ? formatDuration(r.durationMs) : "",
-				].filter(Boolean).join(" · ");
-				const line = `${icon} ${theme.fg("toolTitle", r.agent)} ${theme.fg("dim", status)}${stats ? ` ${theme.fg("dim", `· ${stats}`)}` : ""}${r.async ? theme.fg("dim", " · background") : ""}`;
-				return new Text(truncateToWidth(line, width), 0, 0);
-			}
-
-			const lines = d.results.map((r) => {
-				const icon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-				return `${icon} ${theme.fg("toolTitle", r.agent)} ${theme.fg("dim", r.exitCode === 0 ? "ok" : "failed")}`;
-			});
-			return new Text(truncateToWidth(lines.join("\n"), width), 0, 0);
+			const d = result.details as ToolDetails | undefined;
+			if (!d || d.mode === "management") return renderManagementText(result as { content: Array<{ type: string; text?: string }> });
+			if (!d.results.length) return new Text("", 0, 0);
+			if (d.mode === "single") return renderSingleResult(d.results[0]!, options.expanded, theme);
+			return renderParallelResult(d, options.expanded, theme);
 		},
 	});
 
-	// /subagents command for users to check async runs
 	pi.registerCommand("subagents", {
 		description: "List running and completed async subagent runs",
 		handler: async (_args, ctx) => {
@@ -634,72 +951,21 @@ USAGE NOTES:
 			}
 
 			const lines: string[] = ["--- Async Subagents ---"];
-			let running = 0;
-			for (const run of asyncRuns.values()) {
-				const elapsed = run.endedAt
-					? formatDuration(run.endedAt - run.startedAt)
-					: formatDuration(Date.now() - run.startedAt);
-				const status = run.status === "running" ? "● running" : run.status === "completed" ? "✓ completed" : "✗ failed";
-				if (run.status === "running") running++;
-				lines.push(`  ${status} ${run.agent} (${run.runId}) · ${elapsed}`);
-				lines.push(`    output: ${run.output}`);
+			for (const batch of asyncBatches.values()) {
+				const runs = batch.runIds.map((id) => asyncRuns.get(id)).filter((r): r is AsyncRun => Boolean(r));
+				const running = runs.filter((r) => r.status === "running").length;
+				const completed = runs.filter((r) => r.status === "completed").length;
+				const failed = runs.filter((r) => r.status === "failed").length;
+				lines.push(`batch ${batch.batchId} (${batch.mode}) · ${completed}/${runs.length} completed${running ? `, ${running} running` : ""}${failed ? `, ${failed} failed` : ""}`);
+				for (const run of runs) {
+					const elapsed = run.endedAt ? formatDuration(run.endedAt - run.startedAt) : formatDuration(Date.now() - run.startedAt);
+					lines.push(`  ${run.status} ${run.agent} (${run.runId}) · ${elapsed}`);
+					lines.push(`    output: ${run.output}`);
+					if (run.error) lines.push(`    error: ${run.error}`);
+				}
 			}
-			lines.push(`--- ${asyncRuns.size} total${running > 0 ? `, ${running} running` : ""} ---`);
 
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
-	});
-
-	// Listen for async subagent completion and notify the main agent
-	const unsubscribe = pi.events.on(ASYNC_COMPLETE_EVENT, (data: unknown) => {
-		const event = data as {
-			runId: string;
-			agent: string;
-			status: string;
-			output: string;
-			durationMs?: number;
-		};
-
-		let preview = "(no output)";
-		try {
-			if (fs.existsSync(event.output)) {
-				const content = fs.readFileSync(event.output, "utf-8").trim();
-				if (content) {
-					const lines = content.split("\n");
-					preview = lines.slice(0, 8).join("\n");
-					if (lines.length > 8) preview += "\n...";
-				}
-			}
-		} catch { /* best effort */ }
-
-		const duration = event.durationMs ? ` (${formatDuration(event.durationMs)})` : "";
-
-		const content = [
-			`Background task ${event.status}: **${event.agent}**${duration}`,
-			"",
-			`Output file: ${event.output}`,
-			"",
-			preview,
-		].join("\n");
-
-		pi.sendMessage(
-			{
-				customType: "subagent-notify",
-				content,
-				display: true,
-				details: {
-					runId: event.runId,
-					agent: event.agent,
-					status: event.status,
-					output: event.output,
-				},
-			},
-			{ triggerTurn: true },
-		);
-	});
-
-	// Cleanup on shutdown
-	pi.on("session_shutdown", () => {
-		if (typeof unsubscribe === "function") unsubscribe();
 	});
 }

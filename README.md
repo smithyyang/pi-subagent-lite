@@ -2,7 +2,7 @@
 
 **Lightweight subagent for pi — async, concurrent, file-based results.**
 
-A minimal pi extension that delegates tasks to isolated `pi` child processes. Each subagent writes its result to a file you specify. No chains, no parallel orchestrator, no management CRUD, no attention tracking — just spawn, work, write.
+A minimal pi extension that delegates tasks to isolated `pi` child processes. Each subagent writes its result to a file you specify. It supports single-task delegation and one-call parallel `tasks[]` batches. No chains, no management CRUD, no attention tracking — just spawn, work, write.
 
 ## Install
 
@@ -27,7 +27,7 @@ List available agents and inspect their details, then delegate a research task.
 The model will:
 1. Call `subagent(action="list")` to discover available agents
 2. Call `subagent(action="get", agent="explorer")` to inspect an agent's details
-3. Call `subagent(agent="explorer", prompt="...", output="/tmp/result.md")` to delegate
+3. Call `subagent(agent="explorer", prompt="...", output="/tmp/result.md")` to delegate one task, or `subagent(tasks=[...])` to start a parallel batch
 
 ### Parameters
 
@@ -36,8 +36,9 @@ The model will:
 | `action` | `string` | No | — | `"list"` to discover agents, `"get"` to inspect an agent. Omit to delegate. |
 | `agent` | `string` | For delegation & `get` | — | Agent name. |
 | `prompt` | `string` | For delegation | — | Full task description. Include all context. |
-| `output` | `string` | For delegation | — | Absolute file path for result (e.g. `/tmp/research.md`). |
-| `async` | `boolean` | No | `true` | Run in background. `false` waits for completion. |
+| `output` | `string` | For single delegation | — | Absolute file path for result (e.g. `/tmp/research.md`). |
+| `tasks` | `array` | For parallel delegation | — | Array of `{ agent, prompt, output }`; all tasks start concurrently in one batch. |
+| `async` | `boolean` | No | `true` | Run in background. `false` waits for all tasks to complete. |
 
 ### Usage Notes (shown to the model)
 
@@ -45,9 +46,9 @@ The tool's description instructs the model to:
 
 1. Use `action="list"` first to discover agents before delegating.
 2. Use `action="get"` to review an agent's full description, tools, and config.
-3. Launch multiple subagents concurrently when possible.
+3. Launch multiple subagents concurrently when possible; prefer one tool call with `tasks[]` for parallel work.
 4. Once delegated, do not duplicate the work — continue with non-overlapping tasks.
-5. The subagent writes its result to the output file; summarize it for the user.
+5. Async batches notify the main agent once when the whole batch finishes; read output files and summarize results for the user.
 6. Each subagent starts fresh — provide a highly detailed, self-contained task.
 7. Tell the subagent whether to write code or do research; it does not inherit your session context.
 
@@ -103,13 +104,13 @@ The body of the markdown file becomes the agent's system prompt (appended to pi'
 
 1. Model calls `subagent(action="list")` to see available agents
 2. Model calls `subagent(action="get", agent="name")` to inspect agent details
-3. Model calls `subagent(agent, prompt, output, async=true)` to delegate
-4. Extension spawns a **separate `pi` process** with the agent's system prompt and tools
-5. The subagent runs fully isolated — its own model, tools, and session
-6. The task includes an instruction to write the result to the output file
+3. Model calls `subagent(agent, prompt, output, async=true)` for one task or `subagent(tasks=[...], async=true)` for a parallel batch
+4. Extension spawns **separate `pi` processes** with each agent's system prompt and tools
+5. Each subagent runs fully isolated — its own model, tools, and session
+6. Each task includes an instruction to write the result to its output file
 7. When `async=true`, control returns immediately; the parent continues working
-8. When `async=false`, the parent waits for the child to finish
-9. The parent reads the output file to get results at any time
+8. When `async=false`, the parent waits for all child processes to finish
+9. Async batches send one follow-up notification when all subagents finish
 
 ### Async Workflow
 
@@ -120,12 +121,14 @@ Model: subagent(action="list")
 Model: subagent(action="get", agent="explorer")
   → Gets: full agent detail (description, tools, system prompt, model)
 
-Model: subagent(agent="explorer", prompt="Find all API routes", 
-                 output="/tmp/api-routes.md", async=true)
-  → Returns: run_id: "abc123"
+Model: subagent(tasks=[
+  {agent:"explorer", prompt:"Find API routes", output:"/tmp/api-routes.md"},
+  {agent:"researcher", prompt:"Research framework docs", output:"/tmp/docs.md"}
+], async=true)
+  → Returns: batch_id: "abc123" and run ids
 
 Model: (continues working on non-overlapping task...)
-  → Can read /tmp/api-routes.md at any point
+  → Gets a follow-up notification when the whole batch finishes
 ```
 
 ## Design Philosophy
@@ -133,9 +136,9 @@ Model: (continues working on non-overlapping task...)
 - **One tool with discovery** — `subagent` does everything: list, inspect, delegate.
 - **Discover before delegate** — The model must first list then inspect agents before using them.
 - **File-based results** — The output file is the contract. No complex IPC.
-- **Async by default** — Fire and forget. Poll the file when you need the result.
+- **Async by default** — Fire and forget. A batch-level callback notifies the main agent when done.
 - **No concurrency limits** — Spawn as many as you want. The OS handles scheduling.
-- **No chains or parallel groups** — The LLM is smart enough to orchestrate multiple calls.
+- **Parallel without chains** — Use `tasks[]` for one-call fan-out; no chain DSL or orchestration framework.
 - **No management API** — Agents are files. Add/remove by creating/deleting `.md` files.
 
 ## License

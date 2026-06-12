@@ -7,7 +7,7 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/your-username/pi-subagent-lite.git"
+    "url": "git+https://github.com/smithyyang/pi-subagent-lite.git"
   },
   "keywords": [
     "pi-package",

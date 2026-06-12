@@ -132,6 +132,17 @@ function parseFrontmatter(text: string): ParsedAgentFile | null {
 	return { attrs, body };
 }
 
+function toArray(val: unknown): string[] | undefined {
+	if (val === undefined || val === null) return undefined;
+	if (Array.isArray(val)) return val.map(String);
+	// Comma-separated string: "read, write, grep"
+	if (typeof val === "string") {
+		const items = val.split(",").map((s) => s.trim()).filter(Boolean);
+		return items.length > 0 ? items : undefined;
+	}
+	return undefined;
+}
+
 function loadAgentDef(filePath: string): AgentDef | null {
 	try {
 		const text = fs.readFileSync(filePath, "utf-8");
@@ -148,8 +159,8 @@ function loadAgentDef(filePath: string): AgentDef | null {
 			systemPrompt: parsed.body,
 			model: parsed.attrs.model as string | undefined,
 			thinking: parsed.attrs.thinking as string | undefined,
-			tools: parsed.attrs.tools as string[] | undefined,
-			extensions: parsed.attrs.extensions as string[] | undefined,
+			tools: toArray(parsed.attrs.tools),
+			extensions: toArray(parsed.attrs.extensions),
 		};
 	} catch {
 		return null;
@@ -219,7 +230,10 @@ function buildChildArgs(agent: AgentDef, prompt: string, output: string): string
 
 	if (agent.model) args.push("--model", agent.model);
 	if (agent.thinking) args.push("--thinking", agent.thinking);
-	if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
+	const allowedTools = agent.tools?.length
+		? [...new Set([...agent.tools, "write"])]
+		: undefined;
+	if (allowedTools?.length) args.push("--tools", allowedTools.join(","));
 
 	if (agent.extensions?.length) {
 		for (const ext of agent.extensions) args.push("--extension", ext);

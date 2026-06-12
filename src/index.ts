@@ -17,7 +17,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ============================================================================
@@ -59,6 +59,8 @@ interface ResultRow {
 	runId?: string;
 	batchId?: string;
 	agent: string;
+	model?: string;
+	thinking?: string;
 	status: RunStatus;
 	exitCode: number | null;
 	error?: string;
@@ -79,6 +81,8 @@ interface AsyncRun {
 	runId: string;
 	batchId: string;
 	agent: string;
+	model?: string;
+	thinking?: string;
 	prompt: string;
 	output: string;
 	proc: ChildProcess | null;
@@ -104,6 +108,8 @@ interface CompletionEvent {
 	runs: Array<{
 		runId: string;
 		agent: string;
+		model?: string;
+		thinking?: string;
 		status: RunStatus;
 		output: string;
 		error?: string;
@@ -123,7 +129,7 @@ const AGENT_USER_DIRS = [
 const BUILTIN_AGENTS_DIR = new URL("../agents/", import.meta.url).pathname;
 
 const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_LITE_CHILD";
-const ASYNC_COMPLETE_EVENT = "subagent:async-complete";
+const ASYNC_COMPLETE_EVENT = "pi-subagent-lite:async-complete";
 const WIDGET_KEY = "pi-subagent-lite";
 const NOTIFY_UNSUB_KEY = "__pi_subagent_lite_notify_unsubscribe__";
 const NOTIFY_SEEN_KEY = "__pi_subagent_lite_notify_seen__";
@@ -309,11 +315,10 @@ function buildChildArgs(agent: AgentDef, prompt: string, output: string): { args
 	const allowedTools = agent.tools?.length ? [...new Set([...agent.tools, "write"])] : undefined;
 	if (allowedTools?.length) args.push("--tools", allowedTools.join(","));
 
-	if (agent.extensions?.length) {
-		for (const ext of agent.extensions) args.push("--extension", ext);
-	} else {
-		args.push("--no-extensions");
-	}
+	// Avoid duplicate extension discovery in children. If an agent needs extension
+	// tools, load exactly the extensions declared by that agent.
+	args.push("--no-extensions");
+	for (const ext of resolveAgentExtensions(agent)) args.push("--extension", ext);
 
 	const fullTask = `Task: ${prompt}\n\nWrite your final result to this file: ${output}${OUTPUT_INSTRUCTION}`;
 
@@ -334,6 +339,52 @@ function cleanupTempDirs(tempDirs: string[]): void {
 	for (const dir of tempDirs) {
 		try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 	}
+}
+
+function expandTilde(filePath: string): string {
+	return filePath.startsWith("~/") ? path.join(os.homedir(), filePath.slice(2)) : filePath;
+}
+
+function packageExtensionFiles(packageDir: string): string[] {
+	try {
+		const packageJsonPath = path.join(packageDir, "package.json");
+		if (fs.existsSync(packageJsonPath)) {
+			const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8")) as { pi?: { extensions?: string[] } };
+			const extensions = pkg.pi?.extensions;
+			if (Array.isArray(extensions) && extensions.length > 0) {
+				return extensions.map((ext) => path.resolve(packageDir, ext));
+			}
+		}
+	} catch { /* fallback below */ }
+
+	const fallback = path.join(packageDir, "src", "index.ts");
+	return fs.existsSync(fallback) ? [fallback] : [];
+}
+
+function resolveExtensionSpec(spec: string): string[] {
+	const expanded = expandTilde(spec);
+	if (fs.existsSync(expanded)) {
+		const stat = fs.statSync(expanded);
+		return stat.isDirectory() ? packageExtensionFiles(expanded) : [expanded];
+	}
+
+	if (spec.startsWith("git:github.com/")) {
+		const repo = spec.slice("git:".length).replace(/\.git$/, "");
+		const dir = path.join(os.homedir(), ".pi", "agent", "git", repo);
+		return packageExtensionFiles(dir);
+	}
+
+	if (spec.startsWith("npm:")) {
+		const pkg = spec.slice("npm:".length);
+		const dir = path.join(os.homedir(), ".pi", "agent", "npm", "node_modules", pkg);
+		return packageExtensionFiles(dir);
+	}
+
+	return [spec];
+}
+
+function resolveAgentExtensions(agent: AgentDef): string[] {
+	return [...new Set((agent.extensions ?? []).flatMap(resolveExtensionSpec))];
 }
 
 function spawnChild(
@@ -460,8 +511,16 @@ function previewText(text: string, maxLines = 6): string {
 	].join("\n");
 }
 
+function modelBadge(model?: string, thinking?: string): string {
+	if (!model && !thinking) return "";
+	if (model && thinking) return `${model}:${thinking}`;
+	return model || thinking || "";
+}
+
 function rowStats(row: ResultRow): string[] {
 	const stats: string[] = [];
+	const model = modelBadge(row.model, row.thinking);
+	if (model) stats.push(model);
 	if (row.durationMs > 0) stats.push(formatDuration(row.durationMs));
 	if (row.async && row.status === "running") stats.push("background");
 	return stats;
@@ -525,6 +584,7 @@ function renderParallelResult(details: ToolDetails, expanded: boolean, theme: Th
 function renderAsyncWidget(asyncRuns: Map<string, AsyncRun>, asyncBatches: Map<string, AsyncBatch>, ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
 	const batches = [...asyncBatches.values()]
+		.filter((batch) => batch.runIds.some((id) => asyncRuns.get(id)?.status === "running"))
 		.sort((a, b) => b.startedAt - a.startedAt)
 		.slice(0, 5);
 	if (batches.length === 0) {
@@ -545,7 +605,8 @@ function renderAsyncWidget(asyncRuns: Map<string, AsyncRun>, asyncBatches: Map<s
 			const stats = running > 0 ? `${running} running · ${completed}/${runs.length} done` : `${completed}/${runs.length} ok${failed ? ` · ${failed} failed` : ""}`;
 			c.addChild(new Text(fit(`${runGlyph(status, theme)} ${theme.fg("toolTitle", bold(theme, label))} ${theme.fg("dim", `· ${stats} · ${batch.batchId}`)}`), 0, 0));
 			for (const run of runs.slice(0, 4)) {
-				c.addChild(new Text(fit(theme.fg("dim", `  ${runGlyph(run.status, theme)} ${run.agent} · ${run.status} · ${shortenPath(run.output)}`)), 0, 0));
+				const model = modelBadge(run.model, run.thinking);
+				c.addChild(new Text(fit(theme.fg("dim", `  ${runGlyph(run.status, theme)} ${run.agent}${model ? ` · ${model}` : ""} · ${run.status} · ${shortenPath(run.output)}`)), 0, 0));
 			}
 			if (runs.length > 4) c.addChild(new Text(theme.fg("dim", `  +${runs.length - 4} more`), 0, 0));
 		}
@@ -582,8 +643,9 @@ function buildCompletionContent(event: CompletionEvent): string {
 		const duration = run.durationMs ? ` (${formatDuration(run.durationMs)})` : "";
 		const out = readOutputFile(run.output);
 		const preview = previewText(out, 8) || run.error || "(no output)";
+		const model = modelBadge(run.model, run.thinking);
 		return [
-			`Background task ${run.status}: **${run.agent}**${duration}`,
+			`Background task ${run.status}: **${run.agent}**${model ? ` (${model})` : ""}${duration}`,
 			"",
 			`Output file: ${run.output}`,
 			"",
@@ -599,7 +661,8 @@ function buildCompletionContent(event: CompletionEvent): string {
 	];
 	for (const run of runs) {
 		const duration = run.durationMs ? ` · ${formatDuration(run.durationMs)}` : "";
-		lines.push(`- **${run.agent}**: ${run.status}${duration}`);
+		const model = modelBadge(run.model, run.thinking);
+		lines.push(`- **${run.agent}**${model ? ` (${model})` : ""}: ${run.status}${duration}`);
 		lines.push(`  Output: ${run.output}`);
 		if (run.error) lines.push(`  Error: ${run.error}`);
 	}
@@ -688,6 +751,8 @@ export default function (pi: ExtensionAPI): void {
 			runs: runs.map((run) => ({
 				runId: run.runId,
 				agent: run.agent,
+				model: run.model,
+				thinking: run.thinking,
 				status: run.status,
 				output: run.output,
 				error: run.error,
@@ -710,6 +775,11 @@ export default function (pi: ExtensionAPI): void {
 	};
 
 	registerCompletionNotifier(pi);
+
+	// Clear stale widgets from older extension instances after reload/startup.
+	pi.on("agent_start", (_event, ctx) => {
+		renderAsyncWidget(asyncRuns, asyncBatches, ctx);
+	});
 
 	pi.registerTool({
 		name: "subagent",
@@ -798,6 +868,7 @@ USAGE NOTES:
 					`**Thinking:** ${agent.thinking || "(pi default)"}`,
 					`**Tools:** ${agent.tools?.length ? agent.tools.join(", ") : "(all built-in tools)"}`,
 					`**Extensions:** ${agent.extensions?.length ? agent.extensions.join(", ") : "none"}`,
+					`**Resolved extensions:** ${resolveAgentExtensions(agent).length ? resolveAgentExtensions(agent).join(", ") : "none"}`,
 					``,
 					`**System prompt:**`,
 					agent.systemPrompt ? `\`\`\`\n${agent.systemPrompt}\n\`\`\`` : "(none)",
@@ -853,6 +924,8 @@ USAGE NOTES:
 						runId,
 						batchId,
 						agent: task.agent,
+						model: agent.model,
+						thinking: agent.thinking,
 						prompt: task.prompt,
 						output: task.output,
 						proc,
@@ -866,6 +939,8 @@ USAGE NOTES:
 						runId,
 						batchId,
 						agent: task.agent,
+						model: agent.model,
+						thinking: agent.thinking,
 						status: "running",
 						exitCode: null,
 						output: "",
@@ -890,7 +965,7 @@ USAGE NOTES:
 				const runId = randomUUID().slice(0, 12);
 				const startedAt = Date.now();
 				const agent = agentMap.get(task.agent)!;
-				return { task, runId, startedAt, ...spawnChild(agent, task.prompt, task.output, runId) };
+				return { task, agent, runId, startedAt, ...spawnChild(agent, task.prompt, task.output, runId) };
 			});
 			const childResults = await Promise.all(jobs.map((job) => job.promise));
 			const rows: ResultRow[] = childResults.map((result, index) => {
@@ -900,6 +975,8 @@ USAGE NOTES:
 					runId: job.runId,
 					batchId,
 					agent: job.task.agent,
+					model: job.agent.model,
+					thinking: job.agent.thinking,
 					status: result.success ? "completed" : "failed",
 					exitCode: result.exitCode,
 					error: result.error,
@@ -959,7 +1036,8 @@ USAGE NOTES:
 				lines.push(`batch ${batch.batchId} (${batch.mode}) · ${completed}/${runs.length} completed${running ? `, ${running} running` : ""}${failed ? `, ${failed} failed` : ""}`);
 				for (const run of runs) {
 					const elapsed = run.endedAt ? formatDuration(run.endedAt - run.startedAt) : formatDuration(Date.now() - run.startedAt);
-					lines.push(`  ${run.status} ${run.agent} (${run.runId}) · ${elapsed}`);
+					const model = modelBadge(run.model, run.thinking);
+					lines.push(`  ${run.status} ${run.agent}${model ? ` · ${model}` : ""} (${run.runId}) · ${elapsed}`);
 					lines.push(`    output: ${run.output}`);
 					if (run.error) lines.push(`    error: ${run.error}`);
 				}

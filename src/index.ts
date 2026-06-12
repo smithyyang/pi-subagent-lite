@@ -63,6 +63,7 @@ const AGENT_USER_DIRS = [
 const BUILTIN_AGENTS_DIR = new URL("../agents/", import.meta.url).pathname;
 
 const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_LITE_CHILD";
+const ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 const OUTPUT_INSTRUCTION =
 	"\n\n---\n**IMPORTANT:** Write your final result to the output file specified above using the `write` tool. " +
 	"Do not just print the result — write it to the file path provided.";
@@ -360,8 +361,8 @@ Always start by using action="list" to discover available agents before delegati
 
 USAGE NOTES:
 1. Launch multiple subagents concurrently whenever possible, to maximize performance; use a single message with multiple tool uses.
-2. Once you have delegated work to a subagent, do not duplicate that work yourself. Continue with non-overlapping tasks, or wait for the result. For async tasks, check the output file periodically.
-3. The result is written to the output file the subagent returns. Show the user a concise summary of the result in your response.
+2. Once you have delegated work to a subagent, do not duplicate that work yourself. Continue with non-overlapping tasks while the subagent runs.
+3. When an async subagent completes, you will be automatically notified via a follow-up message. Read the output file at the specified path to get the full result.
 4. Each subagent invocation starts with a fresh context. Your prompt should contain a highly detailed task description for the subagent to perform autonomously. Specify exactly what information the agent should write to the output file.
 5. The subagent's outputs should generally be trusted.
 6. Clearly tell the subagent whether you expect it to write code or just do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent. Tell it how to verify its work if possible.
@@ -489,7 +490,7 @@ USAGE NOTES:
 					run.proc = null;
 
 					try {
-						pi.events.emit("subagent:async-complete", {
+						pi.events.emit(ASYNC_COMPLETE_EVENT, {
 							runId,
 							agent: agentName,
 							status: run.status,
@@ -649,7 +650,56 @@ USAGE NOTES:
 		},
 	});
 
-	pi.on("subagent:async-complete", (_event) => {
-		// Notification handled by TUI automatically
+	// Listen for async subagent completion and notify the main agent
+	const unsubscribe = pi.events.on(ASYNC_COMPLETE_EVENT, (data: unknown) => {
+		const event = data as {
+			runId: string;
+			agent: string;
+			status: string;
+			output: string;
+			durationMs?: number;
+		};
+
+		let preview = "(no output)";
+		try {
+			if (fs.existsSync(event.output)) {
+				const content = fs.readFileSync(event.output, "utf-8").trim();
+				if (content) {
+					const lines = content.split("\n");
+					preview = lines.slice(0, 8).join("\n");
+					if (lines.length > 8) preview += "\n...";
+				}
+			}
+		} catch { /* best effort */ }
+
+		const duration = event.durationMs ? ` (${formatDuration(event.durationMs)})` : "";
+
+		const content = [
+			`Background task ${event.status}: **${event.agent}**${duration}`,
+			"",
+			`Output file: ${event.output}`,
+			"",
+			preview,
+		].join("\n");
+
+		pi.sendMessage(
+			{
+				customType: "subagent-notify",
+				content,
+				display: true,
+				details: {
+					runId: event.runId,
+					agent: event.agent,
+					status: event.status,
+					output: event.output,
+				},
+			},
+			{ triggerTurn: true },
+		);
+	});
+
+	// Cleanup on shutdown
+	pi.on("session_shutdown", () => {
+		if (typeof unsubscribe === "function") unsubscribe();
 	});
 }

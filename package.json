@@ -1,0 +1,41 @@
+{
+  "name": "pi-subagent-lite",
+  "version": "0.1.0",
+  "description": "Lightweight subagent for pi — async, concurrent, file-based results",
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-username/pi-subagent-lite.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "subagent",
+    "delegation"
+  ],
+  "files": [
+    "src/**/*.ts",
+    "agents/",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "^0.74.0",
+    "typebox": "^1.1.24"
+  }
+}

@@ -3,8 +3,10 @@
  *
  * One tool:
  *   - Discovery: subagent({ action: "list" | "get" })
- *   - Single delegation: subagent({ agent, prompt, output, async=true })
- *   - Parallel delegation: subagent({ tasks: [{ agent, prompt, output }, ...], async=true })
+ *   - Delegation: subagent({ tasks: [{ agent, prompt, output }, ...], async=true })
+ *
+ * `tasks` is always an array: one item starts one subagent, multiple items start
+ * multiple subagents concurrently in the same batch.
  *
  * Subagents run as isolated `pi -p --no-session` child processes and write their
  * final result to the caller-provided output file. Async runs are grouped into a
@@ -713,22 +715,17 @@ const TaskSchema = Type.Object({
 
 function paramsToTasks(params: Record<string, unknown>): TaskSpec[] | string {
 	const maybeTasks = params.tasks;
-	if (Array.isArray(maybeTasks)) {
-		if (maybeTasks.length === 0) return "tasks must contain at least one task.";
-		return maybeTasks.map((item, index) => {
-			const t = item as Partial<TaskSpec>;
-			if (!t.agent || !t.prompt || !t.output) {
-				throw new Error(`tasks[${index}] requires agent, prompt, and output.`);
-			}
-			return { agent: t.agent, prompt: t.prompt, output: t.output };
-		});
+	if (!Array.isArray(maybeTasks)) {
+		return "Delegation requires tasks: [{ agent, prompt, output }]. Use one item for one subagent, or multiple items for parallel work.";
 	}
-
-	const agent = params.agent as string | undefined;
-	const prompt = params.prompt as string | undefined;
-	const output = params.output as string | undefined;
-	if (!agent || !prompt || !output) return "Delegation requires agent, prompt, and output, or tasks[]. Use action=\"list\" to see available agents.";
-	return [{ agent, prompt, output }];
+	if (maybeTasks.length === 0) return "tasks must contain at least one task.";
+	return maybeTasks.map((item, index) => {
+		const t = item as Partial<TaskSpec>;
+		if (!t.agent || !t.prompt || !t.output) {
+			throw new Error(`tasks[${index}] requires agent, prompt, and output.`);
+		}
+		return { agent: t.agent, prompt: t.prompt, output: t.output };
+	});
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -787,15 +784,15 @@ export default function (pi: ExtensionAPI): void {
 		description: `Delegate tasks to specialized subagents, or discover available agents.
 
 USAGE:
-• To delegate one task: { agent: "name", prompt: "...", output: "/tmp/result.md" }
-• To delegate multiple tasks concurrently in one call: { tasks: [{ agent, prompt, output }, ...] }
+• To delegate: { tasks: [{ agent: "name", prompt: "...", output: "/tmp/result.md" }], async?: true }
+• Use one tasks[] item for one subagent, or multiple items for parallel subagents.
 • To list agents: { action: "list" }
 • To get agent details: { action: "get", agent: "name" }
 
 Always start by using action="list" to discover available agents before delegating. Then use action="get" to review an agent's full description, tools, and configuration.
 
 USAGE NOTES:
-1. Launch multiple subagents concurrently whenever possible, to maximize performance; prefer one tool call with tasks[] for parallel work.
+1. Always delegate via tasks[]. Launch multiple subagents concurrently whenever possible by putting multiple items in one tasks[] array.
 2. Once you have delegated work to a subagent, do not duplicate that work yourself. Continue with non-overlapping tasks while the subagent runs.
 3. When an async batch completes, you will be automatically notified via a follow-up message. Read each output file to get the full result.
 4. Each subagent invocation starts with a fresh context. Your prompt should contain a highly detailed task description for the subagent to perform autonomously. Specify exactly what information the agent should write to the output file.
@@ -808,16 +805,10 @@ USAGE NOTES:
 				description: "Management action: 'list' to discover agents, 'get' to inspect an agent's details. Omit to delegate.",
 			})),
 			agent: Type.Optional(Type.String({
-				description: "Agent name. Required for single delegation and action='get'.",
-			})),
-			prompt: Type.Optional(Type.String({
-				description: "Full task description for single delegation. Include all necessary context.",
-			})),
-			output: Type.Optional(Type.String({
-				description: "Absolute file path for the single delegation result.",
+				description: "Agent name. Required only for action='get'. For delegation, put agent inside each tasks[] item.",
 			})),
 			tasks: Type.Optional(Type.Array(TaskSchema, {
-				description: "Parallel delegation: array of {agent, prompt, output}. All tasks start concurrently in one batch.",
+				description: "Delegation tasks: array of {agent, prompt, output}. Use one item for one subagent, multiple items for parallel subagents. All tasks start concurrently in one batch.",
 			})),
 			async: Type.Optional(Type.Boolean({
 				description: "Run in background (default: true). If false, waits for all subagents to finish before returning.",

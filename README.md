@@ -27,17 +27,15 @@ List available agents and inspect their details, then delegate a research task.
 The model will:
 1. Call `subagent(action="list")` to discover available agents
 2. Call `subagent(action="get", agent="explorer")` to inspect an agent's details
-3. Call `subagent(agent="explorer", prompt="...", output="/tmp/result.md")` to delegate one task, or `subagent(tasks=[...])` to start a parallel batch
+3. Call `subagent(tasks=[{agent:"explorer", prompt:"...", output:"/tmp/result.md"}])` to delegate; use one array item for one subagent, or multiple items for parallel subagents
 
 ### Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `action` | `string` | No | — | `"list"` to discover agents, `"get"` to inspect an agent. Omit to delegate. |
-| `agent` | `string` | For delegation & `get` | — | Agent name. |
-| `prompt` | `string` | For delegation | — | Full task description. Include all context. |
-| `output` | `string` | For single delegation | — | Absolute file path for result (e.g. `/tmp/research.md`). |
-| `tasks` | `array` | For parallel delegation | — | Array of `{ agent, prompt, output }`; all tasks start concurrently in one batch. |
+| `agent` | `string` | For `get` only | — | Agent name to inspect. For delegation, put `agent` inside each `tasks[]` item. |
+| `tasks` | `array` | For delegation | — | Array of `{ agent, prompt, output }`. One item = one subagent; multiple items = parallel subagents in one batch. |
 | `async` | `boolean` | No | `true` | Run in background. `false` waits for all tasks to complete. |
 
 ### Usage Notes (shown to the model)
@@ -46,7 +44,7 @@ The tool's description instructs the model to:
 
 1. Use `action="list"` first to discover agents before delegating.
 2. Use `action="get"` to review an agent's full description, tools, and config.
-3. Launch multiple subagents concurrently when possible; prefer one tool call with `tasks[]` for parallel work.
+3. Always delegate via `tasks[]`. Launch multiple subagents concurrently by putting multiple items in one `tasks[]` array.
 4. Once delegated, do not duplicate the work — continue with non-overlapping tasks.
 5. Async batches notify the main agent once when the whole batch finishes; read output files and summarize results for the user.
 6. Each subagent starts fresh — provide a highly detailed, self-contained task.
@@ -104,7 +102,7 @@ The body of the markdown file becomes the agent's system prompt (appended to pi'
 
 1. Model calls `subagent(action="list")` to see available agents
 2. Model calls `subagent(action="get", agent="name")` to inspect agent details
-3. Model calls `subagent(agent, prompt, output, async=true)` for one task or `subagent(tasks=[...], async=true)` for a parallel batch
+3. Model calls `subagent(tasks=[{agent, prompt, output}], async=true)`; one task item starts one subagent, multiple items start a parallel batch
 4. Extension spawns **separate `pi` processes** with each agent's system prompt and tools
 5. Each subagent runs fully isolated — its own model, tools, and session
 6. Each task includes an instruction to write the result to its output file

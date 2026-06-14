@@ -135,9 +135,19 @@ const ASYNC_COMPLETE_EVENT = "pi-subagent-lite:async-complete";
 const WIDGET_KEY = "pi-subagent-lite";
 const NOTIFY_UNSUB_KEY = "__pi_subagent_lite_notify_unsubscribe__";
 const NOTIFY_SEEN_KEY = "__pi_subagent_lite_notify_seen__";
-const OUTPUT_INSTRUCTION =
-	"\n\n---\n**IMPORTANT:** Write your final result to the output file specified above using the `write` tool. " +
-	"Do not just print the result — write it to the file path provided.";
+function outputContractPrompt(output: string): string {
+	return `# Subagent Output Contract
+
+You MUST write your final deliverable to exactly this path:
+${output}
+
+Rules:
+- Use the built-in \`write\` tool to create or overwrite that exact file.
+- Do not use any other default output path, even if your agent prompt mentions one such as /tmp/research.md.
+- Do not claim the file was written unless the \`write\` tool has succeeded.
+- Your final assistant message should be brief (for example: "done") after the file is written.
+- The full deliverable belongs in the file, not in the final assistant message.`;
+}
 
 // ============================================================================
 // Frontmatter Parsing
@@ -309,6 +319,16 @@ function buildChildArgs(agent: AgentDef, prompt: string, output: string): { args
 		args.push("--append-system-prompt", promptFile);
 	}
 
+	// Append the output contract as system-level instructions after the agent
+	// prompt so it overrides any agent-local default output path.
+	{
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-contract-"));
+		tempDirs.push(tmpDir);
+		const contractFile = path.join(tmpDir, "output-contract.md");
+		fs.writeFileSync(contractFile, outputContractPrompt(output), "utf-8");
+		args.push("--append-system-prompt", contractFile);
+	}
+
 	if (agent.model) args.push("--model", agent.model);
 	if (agent.thinking) args.push("--thinking", agent.thinking);
 
@@ -322,7 +342,7 @@ function buildChildArgs(agent: AgentDef, prompt: string, output: string): { args
 	args.push("--no-extensions");
 	for (const ext of resolveAgentExtensions(agent)) args.push("--extension", ext);
 
-	const fullTask = `Task: ${prompt}\n\nWrite your final result to this file: ${output}${OUTPUT_INSTRUCTION}`;
+	const fullTask = `Task: ${prompt}\n\nReminder: your final deliverable must be written with the write tool to exactly this file: ${output}`;
 
 	if (fullTask.length > 8000) {
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-task-"));
@@ -422,6 +442,22 @@ function spawnChild(
 		proc.once("close", (code) => {
 			if (code === 0) {
 				if (!fs.existsSync(output)) {
+					const fallback = extractFallbackOutput(stdout, output);
+					if (fallback) {
+						try {
+							fs.mkdirSync(path.dirname(output), { recursive: true });
+							fs.writeFileSync(output, fallback, "utf-8");
+							finish({ exitCode: code, success: true });
+							return;
+						} catch (error) {
+							finish({
+								exitCode: code,
+								success: false,
+								error: `Subagent produced fallback output but parent failed to write ${output}: ${error instanceof Error ? error.message : String(error)}`,
+							});
+							return;
+						}
+					}
 					finish({
 						exitCode: code,
 						success: false,
@@ -450,6 +486,36 @@ function spawnChild(
 
 function truncateStr(s: string, max: number): string {
 	return s.length > max ? `${s.slice(0, max)}...` : s;
+}
+
+function stripAnsi(text: string): string {
+	return text.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function extractFallbackOutput(stdout: string, output: string): string | undefined {
+	const text = stripAnsi(stdout).trim();
+	if (!text) return undefined;
+
+	const noisePatterns = [
+		/^done\.?$/i,
+		/^file (written|saved)( to)?:/i,
+		/^\*\*file( written to)?[:：]/i,
+		new RegExp(`^${output.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
+	];
+	if (noisePatterns.some((pattern) => pattern.test(text))) return undefined;
+
+	// If the child printed a rendered read/file block for the target output, keep
+	// only the body after the first markdown separator when possible.
+	const fileLine = text.match(/^(?:\*\*)?File(?: written to)?(?:\*\*)?[:：]\s*`?([^`\n]+)`?/im);
+	if (fileLine?.[1]?.trim() === output) {
+		const sepIndex = text.indexOf("---");
+		if (sepIndex >= 0) {
+			const body = text.slice(sepIndex + 3).trim();
+			if (body) return body;
+		}
+	}
+
+	return text.length > 20 ? text : undefined;
 }
 
 function readOutputFile(output: string): string {

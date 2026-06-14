@@ -109,6 +109,7 @@ The body of the markdown file becomes the agent's system prompt (appended to pi'
 7. When `async=true`, control returns immediately; the parent continues working
 8. When `async=false`, the parent waits for all child processes to finish
 9. Async batches send one follow-up notification when all subagents finish
+10. Every child run writes debug logs under `/tmp/pi-subagent-lite-runs/<batchId>/<runId>/`
 
 ### Async Workflow
 
@@ -129,11 +130,29 @@ Model: (continues working on non-overlapping task...)
   → Gets a follow-up notification when the whole batch finishes
 ```
 
+## Debug Logs
+
+Each child subagent run writes a log directory under `/tmp/pi-subagent-lite-runs/<batchId>/<runId>/`:
+
+| File | Description |
+|------|-------------|
+| `task.md` | Exact task passed to the child |
+| `output-contract.md` | System-level file output contract |
+| `args.json` | Child `pi` command arguments, model, tools, extensions |
+| `events.jsonl` | JSON event stream from the child process, with hidden reasoning fields redacted |
+| `tool-calls.jsonl` | Tool execution start/end events |
+| `messages.md` | Visible user/tool/assistant messages captured from the run |
+| `stdout.jsonl` | Raw JSON stdout lines |
+| `stderr.txt` | Child stderr |
+| `status.json` | Run status, output path, exit code, error |
+
+Logs live in `/tmp`, so they are temporary and won't grow your `.pi` directory.
+
 ## Design Philosophy
 
 - **One tool with discovery** — `subagent` does everything: list, inspect, delegate.
 - **Discover before delegate** — The model must first list then inspect agents before using them.
-- **File-based results** — The output file is the contract. No complex IPC.
+- **File-based results** — The output file is the contract. No stdout fallback masks failures.
 - **Async by default** — Fire and forget. A batch-level callback notifies the main agent when done.
 - **No concurrency limits** — Spawn as many as you want. The OS handles scheduling.
 - **Parallel without chains** — Use `tasks[]` for one-call fan-out; no chain DSL or orchestration framework.

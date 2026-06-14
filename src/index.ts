@@ -54,6 +54,7 @@ interface TaskSpec {
 interface ChildResult {
 	exitCode: number | null;
 	success: boolean;
+	logDir: string;
 	error?: string;
 }
 
@@ -68,6 +69,7 @@ interface ResultRow {
 	error?: string;
 	output: string;
 	outputFile: string;
+	logDir?: string;
 	durationMs: number;
 	async: boolean;
 }
@@ -87,6 +89,7 @@ interface AsyncRun {
 	thinking?: string;
 	prompt: string;
 	output: string;
+	logDir: string;
 	proc: ChildProcess | null;
 	status: RunStatus;
 	startedAt: number;
@@ -114,6 +117,7 @@ interface CompletionEvent {
 		thinking?: string;
 		status: RunStatus;
 		output: string;
+		logDir?: string;
 		error?: string;
 		durationMs?: number;
 	}>;
@@ -133,6 +137,7 @@ const BUILTIN_AGENTS_DIR = new URL("../agents/", import.meta.url).pathname;
 const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_LITE_CHILD";
 const ASYNC_COMPLETE_EVENT = "pi-subagent-lite:async-complete";
 const WIDGET_KEY = "pi-subagent-lite";
+const RUNS_DIR = path.join(os.tmpdir(), "pi-subagent-lite-runs");
 const NOTIFY_UNSUB_KEY = "__pi_subagent_lite_notify_unsubscribe__";
 const NOTIFY_SEEN_KEY = "__pi_subagent_lite_notify_seen__";
 function outputContractPrompt(output: string): string {
@@ -305,62 +310,101 @@ function getAgentMap(): { agents: AgentDef[]; agentMap: Map<string, AgentDef> } 
 // Child Process Spawning
 // ============================================================================
 
-function buildChildArgs(agent: AgentDef, prompt: string, output: string): { args: string[]; tempDirs: string[] } {
-	const args: string[] = [];
-	const tempDirs: string[] = [];
+function appendJsonl(filePath: string, value: unknown): void {
+	fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf-8");
+}
 
-	args.push("-p", "--no-session");
+function redactHiddenReasoning(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(redactHiddenReasoning).filter((item) => item !== undefined);
+	if (!value || typeof value !== "object") return value;
+	const out: Record<string, unknown> = {};
+	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+		if (/chain[-_ ]?of[-_ ]?thought|reasoning|hidden[_-]?thinking/i.test(key)) {
+			out[key] = "[redacted]";
+			continue;
+		}
+		if (key === "content" && Array.isArray(child)) {
+			out[key] = child
+				.filter((part) => {
+					const type = typeof part === "object" && part ? (part as { type?: unknown }).type : undefined;
+					return typeof type !== "string" || !/thinking|reasoning/i.test(type);
+				})
+				.map(redactHiddenReasoning);
+			continue;
+		}
+		out[key] = redactHiddenReasoning(child);
+	}
+	return out;
+}
+
+function extractVisibleText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const part of content) {
+		if (!part || typeof part !== "object") continue;
+		const p = part as { type?: string; text?: string; content?: string; name?: string };
+		if (p.type && /thinking|reasoning/i.test(p.type)) continue;
+		if (typeof p.text === "string") parts.push(p.text);
+		else if (typeof p.content === "string") parts.push(p.content);
+	}
+	return parts.join("\n").trim();
+}
+
+function writeRunStatus(logDir: string, status: Record<string, unknown>): void {
+	fs.writeFileSync(path.join(logDir, "status.json"), JSON.stringify(status, null, 2), "utf-8");
+}
+
+function outputFileReady(output: string): boolean {
+	try {
+		return fs.existsSync(output) && fs.statSync(output).size > 0;
+	} catch {
+		return false;
+	}
+}
+
+function buildChildArgs(agent: AgentDef, prompt: string, output: string, logDir: string): { args: string[] } {
+	const args: string[] = [];
+	fs.mkdirSync(logDir, { recursive: true });
+
+	args.push("--mode", "json", "-p", "--no-session");
 
 	if (agent.systemPrompt) {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-		tempDirs.push(tmpDir);
-		const promptFile = path.join(tmpDir, "system-prompt.md");
+		const promptFile = path.join(logDir, "agent-system-prompt.md");
 		fs.writeFileSync(promptFile, agent.systemPrompt, "utf-8");
 		args.push("--append-system-prompt", promptFile);
 	}
 
-	// Append the output contract as system-level instructions after the agent
-	// prompt so it overrides any agent-local default output path.
-	{
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-contract-"));
-		tempDirs.push(tmpDir);
-		const contractFile = path.join(tmpDir, "output-contract.md");
-		fs.writeFileSync(contractFile, outputContractPrompt(output), "utf-8");
-		args.push("--append-system-prompt", contractFile);
-	}
+	const contractFile = path.join(logDir, "output-contract.md");
+	fs.writeFileSync(contractFile, outputContractPrompt(output), "utf-8");
+	args.push("--append-system-prompt", contractFile);
 
 	if (agent.model) args.push("--model", agent.model);
 	if (agent.thinking) args.push("--thinking", agent.thinking);
 
-	// If an agent restricts tools, always add `write`, otherwise it cannot fulfill
-	// the file-based contract. The system prompt still governs what it may modify.
 	const allowedTools = agent.tools?.length ? [...new Set([...agent.tools, "write"])] : undefined;
 	if (allowedTools?.length) args.push("--tools", allowedTools.join(","));
 
-	// Avoid duplicate extension discovery in children. If an agent needs extension
-	// tools, load exactly the extensions declared by that agent.
 	args.push("--no-extensions");
 	for (const ext of resolveAgentExtensions(agent)) args.push("--extension", ext);
 
 	const fullTask = `Task: ${prompt}\n\nReminder: your final deliverable must be written with the write tool to exactly this file: ${output}`;
+	const taskFile = path.join(logDir, "task.md");
+	fs.writeFileSync(taskFile, fullTask, "utf-8");
+	args.push(`@${taskFile}`);
 
-	if (fullTask.length > 8000) {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-task-"));
-		tempDirs.push(tmpDir);
-		const taskFile = path.join(tmpDir, "task.md");
-		fs.writeFileSync(taskFile, fullTask, "utf-8");
-		args.push(`@${taskFile}`);
-	} else {
-		args.push(fullTask);
-	}
+	fs.writeFileSync(path.join(logDir, "args.json"), JSON.stringify({
+		command: "pi",
+		args,
+		agent: agent.name,
+		model: agent.model,
+		thinking: agent.thinking,
+		tools: allowedTools,
+		extensions: resolveAgentExtensions(agent),
+		output,
+	}, null, 2), "utf-8");
 
-	return { args, tempDirs };
-}
-
-function cleanupTempDirs(tempDirs: string[]): void {
-	for (const dir of tempDirs) {
-		try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
-	}
+	return { args };
 }
 
 function expandTilde(filePath: string): string {
@@ -377,10 +421,10 @@ function packageExtensionFiles(packageDir: string): string[] {
 				return extensions.map((ext) => path.resolve(packageDir, ext));
 			}
 		}
-	} catch { /* fallback below */ }
+	} catch { /* use default extension entry below */ }
 
-	const fallback = path.join(packageDir, "src", "index.ts");
-	return fs.existsSync(fallback) ? [fallback] : [];
+	const defaultEntry = path.join(packageDir, "src", "index.ts");
+	return fs.existsSync(defaultEntry) ? [defaultEntry] : [];
 }
 
 function resolveExtensionSpec(spec: string): string[] {
@@ -414,8 +458,28 @@ function spawnChild(
 	prompt: string,
 	output: string,
 	runId: string,
-): { proc: ChildProcess; promise: Promise<ChildResult> } {
-	const { args, tempDirs } = buildChildArgs(agent, prompt, output);
+	batchId: string,
+): { proc: ChildProcess; promise: Promise<ChildResult>; logDir: string } {
+	const logDir = path.join(RUNS_DIR, batchId, runId);
+	fs.mkdirSync(logDir, { recursive: true });
+	const { args } = buildChildArgs(agent, prompt, output, logDir);
+	const eventsPath = path.join(logDir, "events.jsonl");
+	const toolCallsPath = path.join(logDir, "tool-calls.jsonl");
+	const messagesPath = path.join(logDir, "messages.md");
+	const stdoutPath = path.join(logDir, "stdout.jsonl");
+	const stderrPath = path.join(logDir, "stderr.txt");
+
+	writeRunStatus(logDir, {
+		runId,
+		batchId,
+		agent: agent.name,
+		model: agent.model,
+		thinking: agent.thinking,
+		output,
+		state: "running",
+		startedAt: Date.now(),
+	});
+
 	const proc = spawn("pi", args, {
 		env: {
 			...process.env,
@@ -425,46 +489,80 @@ function spawnChild(
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 
-	let stdout = "";
+	let stdoutBuf = "";
 	let stderr = "";
-	proc.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-	proc.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+	let lastAssistantText = "";
+	const processStdoutLine = (line: string) => {
+		if (!line.trim()) return;
+		fs.appendFileSync(stdoutPath, `${line}\n`, "utf-8");
+		let event: Record<string, unknown> | undefined;
+		try {
+			event = JSON.parse(line) as Record<string, unknown>;
+		} catch {
+			appendJsonl(eventsPath, { type: "raw_stdout", line });
+			return;
+		}
+		const safeEvent = redactHiddenReasoning(event);
+		appendJsonl(eventsPath, safeEvent);
+
+		const type = typeof event.type === "string" ? event.type : "";
+		if (type.startsWith("tool_") || type.includes("tool")) appendJsonl(toolCallsPath, safeEvent);
+
+		const message = event.message as { role?: string; content?: unknown } | undefined;
+		if (message?.role) {
+			const text = extractVisibleText(message.content);
+			if (text) {
+				fs.appendFileSync(messagesPath, `\n\n## ${message.role}\n\n${text}\n`, "utf-8");
+				if (message.role === "assistant") lastAssistantText = text;
+			}
+		}
+	};
+
+	proc.stdout?.on("data", (chunk: Buffer) => {
+		stdoutBuf += chunk.toString();
+		const lines = stdoutBuf.split("\n");
+		stdoutBuf = lines.pop() ?? "";
+		for (const line of lines) processStdoutLine(line);
+	});
+	proc.stderr?.on("data", (chunk: Buffer) => {
+		const text = chunk.toString();
+		stderr += text;
+		fs.appendFileSync(stderrPath, text, "utf-8");
+	});
 
 	const promise = new Promise<ChildResult>((resolve) => {
 		let settled = false;
 		const finish = (result: ChildResult) => {
 			if (settled) return;
 			settled = true;
-			cleanupTempDirs(tempDirs);
+			writeRunStatus(logDir, {
+				runId,
+				batchId,
+				agent: agent.name,
+				model: agent.model,
+				thinking: agent.thinking,
+				output,
+				state: result.success ? "completed" : "failed",
+				exitCode: result.exitCode,
+				error: result.error,
+				endedAt: Date.now(),
+				lastAssistantText,
+			});
 			resolve(result);
 		};
 
 		proc.once("close", (code) => {
+			if (stdoutBuf.trim()) processStdoutLine(stdoutBuf);
 			if (code === 0) {
-				if (!fs.existsSync(output)) {
-					const fallback = extractFallbackOutput(stdout, output);
-					if (fallback) {
-						try {
-							fs.mkdirSync(path.dirname(output), { recursive: true });
-							fs.writeFileSync(output, fallback, "utf-8");
-							finish({ exitCode: code, success: true });
-							return;
-						} catch (error) {
-							finish({
-								exitCode: code,
-								success: false,
-								error: `Subagent produced fallback output but parent failed to write ${output}: ${error instanceof Error ? error.message : String(error)}`,
-							});
-							return;
-						}
-					}
+				if (!outputFileReady(output)) {
 					finish({
 						exitCode: code,
 						success: false,
-						error: `Subagent completed but output file was not created: ${output}. stdout: ${truncateStr(stdout, 500)}`,
+						logDir,
+						error: `Subagent completed but output file was not created or was empty: ${output}. Log: ${logDir}`,
 					});
 				} else {
-					finish({ exitCode: code, success: true });
+					finish({ exitCode: code, success: true, logDir });
 				}
 				return;
 			}
@@ -472,50 +570,21 @@ function spawnChild(
 			finish({
 				exitCode: code,
 				success: false,
-				error: `Subagent exited with code ${code}. stderr: ${truncateStr(stderr, 500)}`,
+				logDir,
+				error: `Subagent exited with code ${code}. Log: ${logDir}. stderr: ${truncateStr(stderr, 500)}`,
 			});
 		});
 
 		proc.once("error", (err) => {
-			finish({ exitCode: null, success: false, error: err.message });
+			finish({ exitCode: null, success: false, logDir, error: `${err.message}. Log: ${logDir}` });
 		});
 	});
 
-	return { proc, promise };
+	return { proc, promise, logDir };
 }
 
 function truncateStr(s: string, max: number): string {
 	return s.length > max ? `${s.slice(0, max)}...` : s;
-}
-
-function stripAnsi(text: string): string {
-	return text.replace(/\x1b\[[0-9;]*m/g, "");
-}
-
-function extractFallbackOutput(stdout: string, output: string): string | undefined {
-	const text = stripAnsi(stdout).trim();
-	if (!text) return undefined;
-
-	const noisePatterns = [
-		/^done\.?$/i,
-		/^file (written|saved)( to)?:/i,
-		/^\*\*file( written to)?[:：]/i,
-		new RegExp(`^${output.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
-	];
-	if (noisePatterns.some((pattern) => pattern.test(text))) return undefined;
-
-	// If the child printed a rendered read/file block for the target output, keep
-	// only the body after the first markdown separator when possible.
-	const fileLine = text.match(/^(?:\*\*)?File(?: written to)?(?:\*\*)?[:：]\s*`?([^`\n]+)`?/im);
-	if (fileLine?.[1]?.trim() === output) {
-		const sepIndex = text.indexOf("---");
-		if (sepIndex >= 0) {
-			const body = text.slice(sepIndex + 3).trim();
-			if (body) return body;
-		}
-	}
-
-	return text.length > 20 ? text : undefined;
 }
 
 function readOutputFile(output: string): string {
@@ -606,6 +675,7 @@ function renderSingleResult(row: ResultRow, expanded: boolean, theme: Theme): Co
 	const statsText = stats.length ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", stats.join(" · "))}` : "";
 	c.addChild(new Text(fit(`${runGlyph(row.status, theme)} ${theme.fg("toolTitle", bold(theme, row.agent))} ${theme.fg("dim", "·")} ${statusLabel(row.status, theme)}${statsText}`, width), 0, 0));
 	c.addChild(new Text(fit(theme.fg("dim", `  ⎿ output: ${shortenPath(row.outputFile)}`), width), 0, 0));
+	if (row.logDir) c.addChild(new Text(fit(theme.fg("dim", `    log: ${shortenPath(row.logDir)}`), width), 0, 0));
 	if (row.runId) c.addChild(new Text(fit(theme.fg("dim", `    run: ${row.runId}${row.batchId ? ` · batch: ${row.batchId}` : ""}`), width), 0, 0));
 
 	if (!expanded) return c;
@@ -639,6 +709,7 @@ function renderParallelResult(details: ToolDetails, expanded: boolean, theme: Th
 		const statsText = stats.length ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", stats.join(" · "))}` : "";
 		c.addChild(new Text(fit(`  ${theme.fg("dim", branch)} ${runGlyph(row.status, theme)} ${bold(theme, row.agent)} ${theme.fg("dim", "·")} ${statusLabel(row.status, theme)}${statsText}`, width), 0, 0));
 		c.addChild(new Text(fit(theme.fg("dim", `  ${i === details.results.length - 1 ? " " : "│"}   output: ${shortenPath(row.outputFile)}`), width), 0, 0));
+		if (row.logDir) c.addChild(new Text(fit(theme.fg("dim", `  ${i === details.results.length - 1 ? " " : "│"}   log: ${shortenPath(row.logDir)}`), width), 0, 0));
 		if (expanded && row.error) c.addChild(new Text(fit(theme.fg("error", `  ${i === details.results.length - 1 ? " " : "│"}   error: ${row.error}`), width), 0, 0));
 		if (expanded && row.output) {
 			const first = previewText(row.output, 2).split("\n")[0];
@@ -716,6 +787,7 @@ function buildCompletionContent(event: CompletionEvent): string {
 			`Background task ${run.status}: **${run.agent}**${model ? ` (${model})` : ""}${duration}`,
 			"",
 			`Output file: ${run.output}`,
+			...(run.logDir ? [`Log dir: ${run.logDir}`] : []),
 			"",
 			preview,
 		].join("\n");
@@ -732,6 +804,7 @@ function buildCompletionContent(event: CompletionEvent): string {
 		const model = modelBadge(run.model, run.thinking);
 		lines.push(`- **${run.agent}**${model ? ` (${model})` : ""}: ${run.status}${duration}`);
 		lines.push(`  Output: ${run.output}`);
+		if (run.logDir) lines.push(`  Log: ${run.logDir}`);
 		if (run.error) lines.push(`  Error: ${run.error}`);
 	}
 	return lines.join("\n");
@@ -818,6 +891,7 @@ export default function (pi: ExtensionAPI): void {
 				thinking: run.thinking,
 				status: run.status,
 				output: run.output,
+				logDir: run.logDir,
 				error: run.error,
 				durationMs: run.durationMs,
 			})),
@@ -976,7 +1050,7 @@ USAGE NOTES:
 				for (const task of tasks) {
 					const runId = randomUUID().slice(0, 12);
 					const agent = agentMap.get(task.agent)!;
-					const { proc, promise } = spawnChild(agent, task.prompt, task.output, runId);
+					const { proc, promise, logDir } = spawnChild(agent, task.prompt, task.output, runId, batchId);
 					const run: AsyncRun = {
 						runId,
 						batchId,
@@ -985,6 +1059,7 @@ USAGE NOTES:
 						thinking: agent.thinking,
 						prompt: task.prompt,
 						output: task.output,
+						logDir,
 						proc,
 						status: "running",
 						startedAt: Date.now(),
@@ -1002,6 +1077,7 @@ USAGE NOTES:
 						exitCode: null,
 						output: "",
 						outputFile: task.output,
+						logDir,
 						durationMs: 0,
 						async: true,
 					});
@@ -1022,7 +1098,7 @@ USAGE NOTES:
 				const runId = randomUUID().slice(0, 12);
 				const startedAt = Date.now();
 				const agent = agentMap.get(task.agent)!;
-				return { task, agent, runId, startedAt, ...spawnChild(agent, task.prompt, task.output, runId) };
+				return { task, agent, runId, startedAt, ...spawnChild(agent, task.prompt, task.output, runId, batchId) };
 			});
 			const childResults = await Promise.all(jobs.map((job) => job.promise));
 			const rows: ResultRow[] = childResults.map((result, index) => {
@@ -1039,6 +1115,7 @@ USAGE NOTES:
 					error: result.error,
 					output: outputText,
 					outputFile: job.task.output,
+					logDir: job.logDir,
 					durationMs: Date.now() - job.startedAt,
 					async: false,
 				};
@@ -1062,7 +1139,8 @@ USAGE NOTES:
 				return new Text(`${theme.fg("toolTitle", bold(theme, `subagent ${args.action}${target}`))}`, 0, 0);
 			}
 			const taskCount = Array.isArray(args.tasks) ? args.tasks.length : 1;
-			const label = taskCount > 1 ? `subagent parallel ×${taskCount}` : `subagent ${(args.agent as string) || "?"}`;
+			const firstTask = Array.isArray(args.tasks) ? args.tasks[0] as { agent?: string } | undefined : undefined;
+			const label = taskCount > 1 ? `subagent parallel ×${taskCount}` : `subagent ${firstTask?.agent || "?"}`;
 			const asyncLabel = args.async === false ? theme.fg("dim", " [sync]") : theme.fg("warning", " [async]");
 			return new Text(`${theme.fg("toolTitle", bold(theme, label))}${asyncLabel}`, 0, 0);
 		},
@@ -1096,6 +1174,7 @@ USAGE NOTES:
 					const model = modelBadge(run.model, run.thinking);
 					lines.push(`  ${run.status} ${run.agent}${model ? ` · ${model}` : ""} (${run.runId}) · ${elapsed}`);
 					lines.push(`    output: ${run.output}`);
+					lines.push(`    log: ${run.logDir}`);
 					if (run.error) lines.push(`    error: ${run.error}`);
 				}
 			}

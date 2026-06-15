@@ -137,6 +137,11 @@ const BUILTIN_AGENTS_DIR = new URL("../agents/", import.meta.url).pathname;
 const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_LITE_CHILD";
 const ASYNC_COMPLETE_EVENT = "pi-subagent-lite:async-complete";
 const WIDGET_KEY = "pi-subagent-lite";
+// Child-run diagnostics are kept on disk for humans/plugin developers only.
+// They are intentionally not shown in tool descriptions, model-facing results,
+// notifications, or TUI rows. To inspect a run manually:
+//   ls -td /tmp/pi-subagent-lite-runs/*/* | head
+// Then read status.json, stderr.txt, tool-calls.jsonl, messages.md, etc.
 const RUNS_DIR = path.join(os.tmpdir(), "pi-subagent-lite-runs");
 const NOTIFY_UNSUB_KEY = "__pi_subagent_lite_notify_unsubscribe__";
 const NOTIFY_SEEN_KEY = "__pi_subagent_lite_notify_seen__";
@@ -559,7 +564,7 @@ function spawnChild(
 						exitCode: code,
 						success: false,
 						logDir,
-						error: `Subagent completed but output file was not created or was empty: ${output}. Log: ${logDir}`,
+						error: `Subagent completed but output file was not created or was empty: ${output}.`,
 					});
 				} else {
 					finish({ exitCode: code, success: true, logDir });
@@ -571,12 +576,12 @@ function spawnChild(
 				exitCode: code,
 				success: false,
 				logDir,
-				error: `Subagent exited with code ${code}. Log: ${logDir}. stderr: ${truncateStr(stderr, 500)}`,
+				error: `Subagent exited with code ${code}. stderr: ${truncateStr(stderr, 500)}`,
 			});
 		});
 
 		proc.once("error", (err) => {
-			finish({ exitCode: null, success: false, logDir, error: `${err.message}. Log: ${logDir}` });
+			finish({ exitCode: null, success: false, logDir, error: err.message });
 		});
 	});
 
@@ -675,7 +680,6 @@ function renderSingleResult(row: ResultRow, expanded: boolean, theme: Theme): Co
 	const statsText = stats.length ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", stats.join(" · "))}` : "";
 	c.addChild(new Text(fit(`${runGlyph(row.status, theme)} ${theme.fg("toolTitle", bold(theme, row.agent))} ${theme.fg("dim", "·")} ${statusLabel(row.status, theme)}${statsText}`, width), 0, 0));
 	c.addChild(new Text(fit(theme.fg("dim", `  ⎿ output: ${shortenPath(row.outputFile)}`), width), 0, 0));
-	if (row.logDir) c.addChild(new Text(fit(theme.fg("dim", `    log: ${shortenPath(row.logDir)}`), width), 0, 0));
 	if (row.runId) c.addChild(new Text(fit(theme.fg("dim", `    run: ${row.runId}${row.batchId ? ` · batch: ${row.batchId}` : ""}`), width), 0, 0));
 
 	if (!expanded) return c;
@@ -709,7 +713,6 @@ function renderParallelResult(details: ToolDetails, expanded: boolean, theme: Th
 		const statsText = stats.length ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", stats.join(" · "))}` : "";
 		c.addChild(new Text(fit(`  ${theme.fg("dim", branch)} ${runGlyph(row.status, theme)} ${bold(theme, row.agent)} ${theme.fg("dim", "·")} ${statusLabel(row.status, theme)}${statsText}`, width), 0, 0));
 		c.addChild(new Text(fit(theme.fg("dim", `  ${i === details.results.length - 1 ? " " : "│"}   output: ${shortenPath(row.outputFile)}`), width), 0, 0));
-		if (row.logDir) c.addChild(new Text(fit(theme.fg("dim", `  ${i === details.results.length - 1 ? " " : "│"}   log: ${shortenPath(row.logDir)}`), width), 0, 0));
 		if (expanded && row.error) c.addChild(new Text(fit(theme.fg("error", `  ${i === details.results.length - 1 ? " " : "│"}   error: ${row.error}`), width), 0, 0));
 		if (expanded && row.output) {
 			const first = previewText(row.output, 2).split("\n")[0];
@@ -787,7 +790,6 @@ function buildCompletionContent(event: CompletionEvent): string {
 			`Background task ${run.status}: **${run.agent}**${model ? ` (${model})` : ""}${duration}`,
 			"",
 			`Output file: ${run.output}`,
-			...(run.logDir ? [`Log dir: ${run.logDir}`] : []),
 			"",
 			preview,
 		].join("\n");
@@ -804,7 +806,6 @@ function buildCompletionContent(event: CompletionEvent): string {
 		const model = modelBadge(run.model, run.thinking);
 		lines.push(`- **${run.agent}**${model ? ` (${model})` : ""}: ${run.status}${duration}`);
 		lines.push(`  Output: ${run.output}`);
-		if (run.logDir) lines.push(`  Log: ${run.logDir}`);
 		if (run.error) lines.push(`  Error: ${run.error}`);
 	}
 	return lines.join("\n");
@@ -891,7 +892,6 @@ export default function (pi: ExtensionAPI): void {
 				thinking: run.thinking,
 				status: run.status,
 				output: run.output,
-				logDir: run.logDir,
 				error: run.error,
 				durationMs: run.durationMs,
 			})),
@@ -1077,7 +1077,6 @@ USAGE NOTES:
 						exitCode: null,
 						output: "",
 						outputFile: task.output,
-						logDir,
 						durationMs: 0,
 						async: true,
 					});
@@ -1115,7 +1114,6 @@ USAGE NOTES:
 					error: result.error,
 					output: outputText,
 					outputFile: job.task.output,
-					logDir: job.logDir,
 					durationMs: Date.now() - job.startedAt,
 					async: false,
 				};
@@ -1174,7 +1172,6 @@ USAGE NOTES:
 					const model = modelBadge(run.model, run.thinking);
 					lines.push(`  ${run.status} ${run.agent}${model ? ` · ${model}` : ""} (${run.runId}) · ${elapsed}`);
 					lines.push(`    output: ${run.output}`);
-					lines.push(`    log: ${run.logDir}`);
 					if (run.error) lines.push(`    error: ${run.error}`);
 				}
 			}

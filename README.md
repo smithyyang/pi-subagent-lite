@@ -109,7 +109,7 @@ The body of the markdown file becomes the agent's system prompt (appended to pi'
 7. When `async=true`, control returns immediately; the parent continues working
 8. When `async=false`, the parent waits for all child processes to finish
 9. Async batches send one follow-up notification when all subagents finish
-10. Every child run writes debug logs under `/tmp/pi-subagent-lite-runs/<batchId>/<runId>/`
+10. Child runs keep local diagnostics under `/tmp/pi-subagent-lite-runs/<batchId>/<runId>/` for manual inspection; diagnostics are not part of the model-facing workflow.
 
 ### Async Workflow
 
@@ -130,9 +130,9 @@ Model: (continues working on non-overlapping task...)
   → Gets a follow-up notification when the whole batch finishes
 ```
 
-## Debug Logs
+## Local Diagnostics
 
-Each child subagent run writes a log directory under `/tmp/pi-subagent-lite-runs/<batchId>/<runId>/`:
+Each child subagent run writes a local diagnostics directory under `/tmp/pi-subagent-lite-runs/<batchId>/<runId>/`. This is for humans/plugin developers only and is not shown to the main agent in tool descriptions, notifications, or TUI rows:
 
 | File | Description |
 |------|-------------|
@@ -142,7 +142,7 @@ Each child subagent run writes a log directory under `/tmp/pi-subagent-lite-runs
 | `events.jsonl` | JSON event stream from the child process, with hidden reasoning fields redacted |
 | `tool-calls.jsonl` | Tool execution start/end events |
 | `messages.md` | Visible user/tool/assistant messages captured from the run |
-| `stdout.jsonl` | Raw JSON stdout lines |
+| `stdout.jsonl` | Redacted JSON stdout events |
 | `stderr.txt` | Child stderr |
 | `status.json` | Run status, output path, exit code, error |
 

@@ -98,6 +98,24 @@ The body of the markdown file becomes the agent's system prompt (appended to pi'
 |---------|-------------|
 | `/subagents` | List all running and completed async subagent runs |
 
+## Architecture
+
+```mermaid
+flowchart LR
+    Parent[Pi parent agent] -->|subagent tool call| Extension[pi-subagent-lite]
+    Extension --> Discovery[Agent discovery]
+    Extension --> Coordinator[Sync / async batch coordinator]
+    Coordinator --> ChildA[Isolated pi child process]
+    Coordinator --> ChildB[Isolated pi child process]
+    ChildA --> OutputA[Caller-selected output file]
+    ChildB --> OutputB[Caller-selected output file]
+    ChildA --> Logs[Redacted diagnostics under /tmp]
+    ChildB --> Logs
+    Coordinator -->|one event per completed batch| Parent
+```
+
+The parent and children do not share conversation context. Each child receives an explicit agent prompt, tool/model configuration, and an authoritative output-file contract. Async batches return immediately and emit one completion event only after every child has settled.
+
 ## How It Works
 
 1. Model calls `subagent(action="list")` to see available agents
@@ -160,4 +178,4 @@ Logs live in `/tmp`, so they are temporary and won't grow your `.pi` directory.
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE).

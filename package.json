@@ -5,6 +5,10 @@
   "author": "",
   "license": "MIT",
   "type": "module",
+  "scripts": {
+    "check": "node --input-type=module -e \"await import('./src/index.ts')\"",
+    "test": "node --test test/*.test.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/smithyyang/pi-subagent-lite.git"

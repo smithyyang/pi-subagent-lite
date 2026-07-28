@@ -145,7 +145,7 @@ const WIDGET_KEY = "pi-subagent-lite";
 const RUNS_DIR = path.join(os.tmpdir(), "pi-subagent-lite-runs");
 const NOTIFY_UNSUB_KEY = "__pi_subagent_lite_notify_unsubscribe__";
 const NOTIFY_SEEN_KEY = "__pi_subagent_lite_notify_seen__";
-function outputContractPrompt(output: string): string {
+export function outputContractPrompt(output: string): string {
 	return `# Subagent Output Contract
 
 You MUST write your final deliverable to exactly this path:
@@ -163,7 +163,7 @@ Rules:
 // Frontmatter Parsing
 // ============================================================================
 
-function parseFrontmatter(text: string): ParsedAgentFile | null {
+export function parseFrontmatter(text: string): ParsedAgentFile | null {
 	const match = text.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
 	if (!match) return null;
 
@@ -225,7 +225,7 @@ function parseFrontmatter(text: string): ParsedAgentFile | null {
 	return { attrs, body };
 }
 
-function toArray(val: unknown): string[] | undefined {
+export function toArray(val: unknown): string[] | undefined {
 	if (val === undefined || val === null) return undefined;
 	if (Array.isArray(val)) return val.map(String).map((s) => s.trim()).filter(Boolean);
 	if (typeof val === "string") {
@@ -319,7 +319,7 @@ function appendJsonl(filePath: string, value: unknown): void {
 	fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf-8");
 }
 
-function redactHiddenReasoning(value: unknown): unknown {
+export function redactHiddenReasoning(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(redactHiddenReasoning).filter((item) => item !== undefined);
 	if (!value || typeof value !== "object") return value;
 	const out: Record<string, unknown> = {};
@@ -342,7 +342,7 @@ function redactHiddenReasoning(value: unknown): unknown {
 	return out;
 }
 
-function extractVisibleText(content: unknown): string {
+export function extractVisibleText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	const parts: string[] = [];
@@ -360,7 +360,7 @@ function writeRunStatus(logDir: string, status: Record<string, unknown>): void {
 	fs.writeFileSync(path.join(logDir, "status.json"), JSON.stringify(status, null, 2), "utf-8");
 }
 
-function outputFileReady(output: string): boolean {
+export function outputFileReady(output: string): boolean {
 	try {
 		return fs.existsSync(output) && fs.statSync(output).size > 0;
 	} catch {

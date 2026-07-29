@@ -7,13 +7,14 @@ A minimal pi extension that delegates tasks to isolated `pi` child processes. Ea
 ## Install
 
 ```bash
-pi install git:github.com/smithyyang/pi-subagent-lite.git
+pi install npm:pi-subagent-lite
 ```
 
-Or for local development:
+Git and local development alternatives:
 
 ```bash
-pi -e /home/youngshine/pi-subagent-lite/src/index.ts
+pi install git:github.com/smithyyang/pi-subagent-lite
+pi -e ./src/index.ts
 ```
 
 ## Usage

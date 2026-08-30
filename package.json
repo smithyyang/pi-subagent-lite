@@ -1,6 +1,6 @@
 {
   "name": "pi-subagent-lite",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Lightweight subagent for Pi — async, concurrent, file-based results",
   "author": "youngjurry",
   "license": "MIT",
